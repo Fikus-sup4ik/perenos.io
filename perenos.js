@@ -1,51 +1,53 @@
 (function () {
     'use strict';
 
+    // Защита от повторной инициализации плагина
     if (window.lampa_history_transfer_plugin) return;
     window.lampa_history_transfer_plugin = true;
 
     var PLUGIN_ID = 'history_transfer';
-    var PLUGIN_NAME = 'Lampa History Transfer';
-    var PLUGIN_VERSION = '1.1.0';
-    var SCHEMA_VERSION = 2;
+    var PLUGIN_NAME = 'History Transfer';
+    var PLUGIN_VERSION = '2.0.0';
+    var ARCHIVE_VERSION = 2;
 
     var STORAGE_KEYS = {
-        API_URL: 'ht_api_url',
-        TOKEN: 'ht_auth_token',
-        USER: 'ht_auth_user',
-        INCLUDE_TIMELINE: 'ht_include_timeline',
-        AUTO_SYNC_CUB: 'ht_auto_sync_cub'
+        API_URL: 'ht_v2_api_url',
+        OPERATIONS_LOG: 'ht_v2_operations_log',
+        LOCAL_BACKUP_SLOT: 'ht_v2_local_backup_slot',
+        AUTO_SYNC_CUB: 'ht_v2_auto_sync_cub',
+        INCLUDE_TIMELINE: 'ht_v2_include_timeline',
+        LAST_ACTIVE_CODE: 'ht_v2_last_active_code'
     };
 
     var DEFAULT_API_URL = (window.LAMPA_HISTORY_TRANSFER_CONFIG && window.LAMPA_HISTORY_TRANSFER_CONFIG.apiUrl)
-        || 'https://lampa-history-transfer-api.your-subdomain.workers.dev';
+        || 'https://lampa-history-transfer.your-subdomain.workers.dev';
 
-    // Все 8 списков профиля Lampa/CUB (в дополнение к массиву полных объектов `card`)
+    // Все 8 списков профиля Lampa/CUB, привязанных к массиву полных карточек `card`
     var FAVORITE_LIST_KEYS = [
-        'history',    // История просмотров (раздел «История» в Lampa)
+        'history',    // История просмотров
         'book',       // Закладки
-        'like',       // Понравившиеся
-        'wath',       // Смотрю (оригинальное имя ключа в Lampa)
-        'viewed',     // Просмотрено
-        'scheduled',  // Запланировано
+        'like',       // Избранное / Понравилось
+        'wath',       // Смотрю
+        'viewed',     // Просмотрено (фильмы и сериалы)
+        'scheduled',  // Отложенный просмотр (Запланировано)
         'continued',  // Продолжаю смотреть
         'thrown'      // Брошено
     ];
 
-    var LIST_LABELS = {
+    var LIST_TITLES = {
         history: 'История просмотров',
         book: 'Закладки',
-        like: 'Понравившиеся',
+        like: 'Избранное (Понравилось)',
         wath: 'Смотрю',
         viewed: 'Просмотрено',
-        scheduled: 'Запланировано',
+        scheduled: 'Отложенный просмотр',
         continued: 'Продолжаю смотреть',
         thrown: 'Брошено'
     };
 
     /**
      * ========================================================================
-     * УТИЛИТЫ И КРИПТОГРАФИЯ
+     * ВСПОМОГАТЕЛЬНЫЕ УТИЛИТЫ И КРИПТОГРАФИЯ
      * ========================================================================
      */
     var Utils = {
@@ -54,34 +56,11 @@
             return String(url || DEFAULT_API_URL).replace(/\/+$/, '');
         },
 
-        getToken: function () {
-            return Lampa.Storage.get(STORAGE_KEYS.TOKEN, '');
-        },
-
-        getUser: function () {
-            return Lampa.Storage.get(STORAGE_KEYS.USER, null);
-        },
-
-        isAuthorized: function () {
-            return Boolean(this.getToken() && this.getUser());
-        },
-
-        getCurrentLampaAccountInfo: function () {
-            var acc = Lampa.Storage.get('account', {});
-            var email = Lampa.Storage.get('account_email', '');
-            if (acc && acc.token) {
-                var label = acc.email || email || (acc.profile && acc.profile.name) || ('CUB ID: ' + (acc.id || 'Active'));
-                return {
-                    authorized: true,
-                    id: acc.id || '',
-                    label: String(label)
-                };
-            }
-            return {
-                authorized: false,
-                id: '',
-                label: 'Локальный профиль Lampa (без CUB)'
-            };
+        getDeviceLabel: function () {
+            var platform = (Lampa.Platform && typeof Lampa.Platform.get === 'function')
+                ? Lampa.Platform.get()
+                : 'Browser';
+            return 'Lampa (' + platform + ')';
         },
 
         deepClone: function (obj) {
@@ -90,6 +69,18 @@
             } catch (e) {
                 return obj;
             }
+        },
+
+        formatCode: function (code) {
+            var digits = String(code || '').replace(/[^0-9]/g, '');
+            if (digits.length === 6) {
+                return digits.slice(0, 3) + '-' + digits.slice(3);
+            }
+            return digits;
+        },
+
+        normalizeCode: function (code) {
+            return String(code || '').replace(/[^0-9]/g, '');
         },
 
         sha256: function (str) {
@@ -114,9 +105,9 @@
         },
 
         formatDate: function (ts) {
-            if (!ts) return 'Никогда';
+            if (!ts) return '—';
             var d = new Date(Number(ts));
-            if (isNaN(d.getTime())) return 'Неизвестно';
+            if (isNaN(d.getTime())) return '—';
             var pad = function (n) { return n < 10 ? '0' + n : '' + n; };
             return pad(d.getDate()) + '.' + pad(d.getMonth() + 1) + '.' + d.getFullYear() +
                 ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
@@ -143,6 +134,44 @@
             } else {
                 console.log('[HistoryTransfer]', text);
             }
+        },
+
+        copyToClipboard: function (text) {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                return navigator.clipboard.writeText(text).then(function () {
+                    return true;
+                }).catch(function () {
+                    return false;
+                });
+            }
+            try {
+                var ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.position = 'fixed';
+                ta.style.opacity = '0';
+                document.body.appendChild(ta);
+                ta.select();
+                var ok = document.execCommand('copy');
+                document.body.removeChild(ta);
+                return Promise.resolve(Boolean(ok));
+            } catch (e) {
+                return Promise.resolve(false);
+            }
+        },
+
+        logOperation: function (type, modeLabel, itemsCount, status) {
+            var logs = Lampa.Storage.get(STORAGE_KEYS.OPERATIONS_LOG, []);
+            if (!Array.isArray(logs)) logs = [];
+            logs.unshift({
+                id: Date.now() + '_' + Math.random().toString(36).slice(2, 6),
+                type: type,
+                mode: modeLabel,
+                items: itemsCount,
+                status: status,
+                timestamp: Date.now()
+            });
+            if (logs.length > 30) logs = logs.slice(0, 30);
+            Lampa.Storage.set(STORAGE_KEYS.OPERATIONS_LOG, logs);
         }
     };
 
@@ -154,33 +183,31 @@
     var ApiClient = {
         request: function (method, path, bodyData) {
             var baseUrl = Utils.getApiUrl();
-            var token = Utils.getToken();
+            var timeoutMs = (window.LAMPA_HISTORY_TRANSFER_CONFIG && window.LAMPA_HISTORY_TRANSFER_CONFIG.requestTimeoutMs) || 25000;
 
             return new Promise(function (resolve, reject) {
                 if (!baseUrl || baseUrl.indexOf('http') !== 0) {
-                    reject(new Error('Некорректный URL сервера API. Проверьте настройки.'));
+                    reject(new Error('Некорректный URL сервера API. Проверьте раздел «Настройки».'));
                     return;
-                }
-
-                var headers = {
-                    'Content-Type': 'application/json',
-                    'X-Device-Name': 'Lampa ' + (Lampa.Platform ? Lampa.Platform.get() : 'Client')
-                };
-
-                if (token) {
-                    headers['Authorization'] = 'Bearer ' + token;
                 }
 
                 var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
                 var timeoutId = setTimeout(function () {
                     if (controller) controller.abort();
-                }, 25000);
+                }, timeoutMs);
 
-                var fetchOptions = { method: method, headers: headers };
-                if (controller) fetchOptions.signal = controller.signal;
-                if (bodyData !== undefined) fetchOptions.body = JSON.stringify(bodyData);
+                var options = {
+                    method: method,
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Device-Name': Utils.getDeviceLabel()
+                    }
+                };
 
-                fetch(baseUrl + path, fetchOptions)
+                if (controller) options.signal = controller.signal;
+                if (bodyData !== undefined) options.body = JSON.stringify(bodyData);
+
+                fetch(baseUrl + path, options)
                     .then(function (response) {
                         clearTimeout(timeoutId);
                         return response.text().then(function (text) {
@@ -188,13 +215,9 @@
                             try {
                                 json = JSON.parse(text);
                             } catch (e) {
-                                throw new Error('Сервер вернул некорректный ответ (HTTP ' + response.status + ')');
+                                throw new Error('Сервер временно недоступен (ошибка ответа HTTP ' + response.status + ').');
                             }
                             if (!response.ok || (json && json.ok === false)) {
-                                if (response.status === 401) {
-                                    Lampa.Storage.set(STORAGE_KEYS.TOKEN, '');
-                                    Lampa.Storage.set(STORAGE_KEYS.USER, null);
-                                }
                                 throw new Error((json && json.error) || ('Ошибка сервера HTTP ' + response.status));
                             }
                             return json;
@@ -204,7 +227,9 @@
                     .catch(function (err) {
                         clearTimeout(timeoutId);
                         if (err && err.name === 'AbortError') {
-                            reject(new Error('Превышено время ожидания ответа от сервера.'));
+                            reject(new Error('Сервер временно недоступен (превышено время ожидания).'));
+                        } else if (err && err.message === 'Failed to fetch') {
+                            reject(new Error('Сервер временно недоступен. Проверьте подключение к интернету.'));
                         } else {
                             reject(err);
                         }
@@ -212,206 +237,275 @@
             });
         },
 
-        health: function () { return this.request('GET', '/api/health'); },
-        register: function (username, password) { return this.request('POST', '/api/auth/register', { username: username, password: password }); },
-        login: function (username, password) { return this.request('POST', '/api/auth/login', { username: username, password: password }); },
-        logout: function () { return this.request('POST', '/api/auth/logout'); },
-        getProfile: function () { return this.request('GET', '/api/auth/me'); },
-        getBackupStatus: function () { return this.request('GET', '/api/backup/status'); },
-        uploadBackup: function (payload, checksum, sourceLabel) {
-            return this.request('POST', '/api/backup', {
-                schema_version: SCHEMA_VERSION,
-                source_account_label: sourceLabel,
-                checksum: checksum,
-                payload: payload
+        health: function () {
+            return this.request('GET', '/api/health');
+        },
+
+        createTransfer: function (archive, checksum) {
+            return this.request('POST', '/api/transfer/create', {
+                archive: archive,
+                checksum: checksum
             });
         },
-        downloadBackup: function () { return this.request('GET', '/api/backup'); },
-        confirmImport: function (targetLabel, itemsProcessed) {
-            return this.request('POST', '/api/backup/confirm-import', {
-                target_account_label: targetLabel,
-                items_processed: itemsProcessed
+
+        inspectTransfer: function (code) {
+            return this.request('POST', '/api/transfer/inspect', {
+                code: Utils.normalizeCode(code)
             });
         },
-        deleteBackup: function () { return this.request('DELETE', '/api/backup'); },
-        deleteAccount: function () { return this.request('DELETE', '/api/account'); }
+
+        claimTransfer: function (code) {
+            return this.request('POST', '/api/transfer/claim', {
+                code: Utils.normalizeCode(code)
+            });
+        },
+
+        cancelTransfer: function (code, deleteSecret) {
+            return this.request('POST', '/api/transfer/cancel', {
+                code: Utils.normalizeCode(code),
+                delete_secret: deleteSecret
+            });
+        }
     };
 
     /**
      * ========================================================================
-     * ДВИЖОК ЭКСПОРТА И ИМПОРТА СТРУКТУРЫ LAMPA / CUB
+     * ДВИЖОК СБОРА (ЭКСПОРТА), ПРОВЕРКИ И АТОМАРНОГО ВОССТАНОВЛЕНИЯ (ИМПОРТА)
      * ========================================================================
      */
-    var TransferEngine = {
+    var DataEngine = {
         /**
-         * Чтение актуального объекта favorite из Lampa со всеми 9 полями
+         * Чтение и нормализация объекта favorite со всеми 9 полями
          */
-        readNormalizedFavorite: function () {
-            var raw = Lampa.Storage.get('favorite', {});
-            if ((!raw || !Array.isArray(raw.card)) && Lampa.Favorite && typeof Lampa.Favorite.all === 'function') {
-                raw = Lampa.Favorite.all() || {};
+        readFavoriteData: function () {
+            var raw = null;
+            try {
+                raw = Lampa.Storage.get('favorite', null);
+                if ((!raw || !Array.isArray(raw.card)) && Lampa.Favorite && typeof Lampa.Favorite.all === 'function') {
+                    raw = Lampa.Favorite.all();
+                }
+            } catch (e) {
+                throw new Error('Не удалось получить данные из Lampa.');
             }
 
-            var result = {
+            if (!raw || typeof raw !== 'object') {
+                raw = {};
+            }
+
+            var normalized = {
                 card: Array.isArray(raw.card) ? Utils.deepClone(raw.card) : []
             };
 
             FAVORITE_LIST_KEYS.forEach(function (key) {
-                result[key] = Array.isArray(raw[key]) ? raw[key].slice() : [];
+                normalized[key] = Array.isArray(raw[key]) ? raw[key].slice() : [];
             });
 
-            return result;
+            return normalized;
         },
 
         /**
-         * Подсчёт статистики по всем полям favorite
+         * Подсчёт детальной статистики по всем поддерживаемым категориям
          */
-        getFavoriteStats: function (favObj) {
+        collectStats: function (dataSection) {
+            var fav = (dataSection && dataSection.favorite) ? dataSection.favorite : this.readFavoriteData();
+            var timeline = (dataSection && dataSection.timeline) ? dataSection.timeline : (Lampa.Storage.get('file_view', {}) || {});
+            var onlineView = (dataSection && dataSection.online_view) ? dataSection.online_view : (Lampa.Storage.get('online_view', []) || []);
+            var torrentsView = (dataSection && dataSection.torrents_view) ? dataSection.torrents_view : (Lampa.Storage.get('torrents_view', []) || []);
+
             var stats = {
-                cards: Array.isArray(favObj.card) ? favObj.card.length : 0,
-                totalListItems: 0,
-                byList: {}
+                cards: Array.isArray(fav.card) ? fav.card.length : 0,
+                byList: {},
+                totalListsItems: 0,
+                timelineCount: typeof timeline === 'object' && timeline !== null ? Object.keys(timeline).length : 0,
+                episodesCount: (Array.isArray(onlineView) ? onlineView.length : 0) + (Array.isArray(torrentsView) ? torrentsView.length : 0)
             };
 
             FAVORITE_LIST_KEYS.forEach(function (key) {
-                var len = Array.isArray(favObj[key]) ? favObj[key].length : 0;
-                stats.byList[key] = len;
-                stats.totalListItems += len;
+                var count = Array.isArray(fav[key]) ? fav[key].length : 0;
+                stats.byList[key] = count;
+                stats.totalListsItems += count;
             });
 
             return stats;
         },
 
         /**
-         * ЭТАП 6: Сбор полного слепка профиля Lampa/CUB (все 9 полей favorite + timeline)
+         * Сбор полного структурированного архива для переноса (без токенов и паролей)
          */
-        collectLocalHistory: function () {
+        buildExportArchive: function () {
             var includeTimeline = Lampa.Storage.get(STORAGE_KEYS.INCLUDE_TIMELINE, true);
-            var favoriteData = this.readNormalizedFavorite();
+            var favorite = this.readFavoriteData();
 
-            // Индексируем полные объекты карточек и проверяем целостность связей ID <-> card
-            var cardIndex = {};
-            var deduplicatedCards = [];
-
-            favoriteData.card.forEach(function (c) {
+            // Дедупликация карточек с сохранением полных объектов TMDB/CUB
+            var cardMap = {};
+            var uniqueCards = [];
+            favorite.card.forEach(function (c) {
                 if (!c || c.id === undefined || c.id === null) return;
                 var idStr = String(c.id);
-                if (!cardIndex[idStr]) {
-                    cardIndex[idStr] = c;
-                    deduplicatedCards.push(c);
+                if (!cardMap[idStr]) {
+                    cardMap[idStr] = c;
+                    uniqueCards.push(c);
                 }
             });
+            favorite.card = uniqueCards;
 
-            favoriteData.card = deduplicatedCards;
-
-            // Проверяем, все ли ID из списков имеют соответствующую карточку в `card`
-            var orphanIdsCount = 0;
+            // Удаление дубликатов внутри каждого из 8 списков с сохранением порядка
             FAVORITE_LIST_KEYS.forEach(function (key) {
-                var seenInList = {};
-                var cleanList = [];
-                favoriteData[key].forEach(function (id) {
+                var seen = {};
+                var clean = [];
+                favorite[key].forEach(function (id) {
                     var idStr = String(id);
-                    if (seenInList[idStr]) return;
-                    seenInList[idStr] = true;
-                    cleanList.push(id);
-                    if (!cardIndex[idStr]) {
-                        orphanIdsCount++;
+                    if (!seen[idStr]) {
+                        seen[idStr] = true;
+                        clean.push(id);
                     }
                 });
-                favoriteData[key] = cleanList;
+                favorite[key] = clean;
             });
 
-            // Дополнительно собираем прогресс серий (file_view / online_view / torrents_view)
-            var timelineExport = {};
-            var onlineViewExport = [];
-            var torrentsViewExport = [];
+            // Прогресс просмотра, сезоны и просмотренные серии
+            var timeline = {};
+            var onlineView = [];
+            var torrentsView = [];
+            var seasonView = {};
 
             if (includeTimeline) {
                 var rawTimeline = Lampa.Storage.get('file_view', {});
                 if (rawTimeline && typeof rawTimeline === 'object') {
                     Object.keys(rawTimeline).forEach(function (hash) {
-                        var item = rawTimeline[hash];
-                        if (item && typeof item === 'object') {
-                            timelineExport[hash] = {
-                                hash: item.hash || hash,
-                                percent: Number(item.percent || 0),
-                                time: Number(item.time || 0),
-                                duration: Number(item.duration || 0)
+                        var entry = rawTimeline[hash];
+                        if (entry && typeof entry === 'object') {
+                            timeline[hash] = {
+                                hash: entry.hash || hash,
+                                percent: Number(entry.percent || 0),
+                                time: Number(entry.time || 0),
+                                duration: Number(entry.duration || 0)
                             };
                         }
                     });
                 }
 
                 var rawOnline = Lampa.Storage.get('online_view', []);
-                if (Array.isArray(rawOnline)) onlineViewExport = rawOnline.slice();
+                if (Array.isArray(rawOnline)) onlineView = rawOnline.slice();
 
                 var rawTorrents = Lampa.Storage.get('torrents_view', []);
-                if (Array.isArray(rawTorrents)) torrentsViewExport = rawTorrents.slice();
+                if (Array.isArray(rawTorrents)) torrentsView = rawTorrents.slice();
+
+                var rawSeasons = Lampa.Storage.get('season_view', {});
+                if (rawSeasons && typeof rawSeasons === 'object') seasonView = Utils.deepClone(rawSeasons);
             }
 
             return {
-                exported_at: Date.now(),
+                version: ARCHIVE_VERSION,
+                created_at: Date.now(),
+                source: 'lampa',
                 plugin_version: PLUGIN_VERSION,
-                source_account: Utils.getCurrentLampaAccountInfo(),
-                integrity: {
-                    cards_total: favoriteData.card.length,
-                    orphan_ids: orphanIdsCount
-                },
-                favorite: favoriteData,
-                timeline: timelineExport,
-                online_view: onlineViewExport,
-                torrents_view: torrentsViewExport
+                data: {
+                    favorite: favorite,
+                    timeline: timeline,
+                    online_view: onlineView,
+                    torrents_view: torrentsView,
+                    season_view: seasonView
+                }
             };
         },
 
-        validateBeforeUpload: function (payload) {
-            if (!payload || !payload.favorite) {
-                return 'Не удалось прочитать структуру данных Lampa.';
+        /**
+         * Проверка архива перед отправкой или импортом
+         */
+        validateArchive: function (archive, allowEmpty) {
+            if (!archive || typeof archive !== 'object') {
+                return 'Ошибка проверки данных: файл не является корректным JSON-архивом.';
             }
-            var stats = this.getFavoriteStats(payload.favorite);
-            var timelineCount = Object.keys(payload.timeline || {}).length;
+            if (!archive.version || Number(archive.version) > ARCHIVE_VERSION) {
+                return 'Неподдерживаемая версия архива (' + (archive.version || 'неизвестна') + '). Обновите плагин.';
+            }
+            if (!archive.data || typeof archive.data !== 'object' || !archive.data.favorite) {
+                return 'Ошибка проверки данных: отсутствует структура пользовательских списков.';
+            }
+            if (!Array.isArray(archive.data.favorite.card) || !Array.isArray(archive.data.favorite.history)) {
+                return 'Ошибка проверки данных: повреждены списки карточек или истории.';
+            }
 
-            if (stats.cards === 0 && stats.totalListItems === 0 && timelineCount === 0) {
-                return 'На текущем аккаунте Lampa не найдено записей истории, закладок или таймкодов.';
+            if (!allowEmpty) {
+                var stats = this.collectStats(archive.data);
+                if (stats.cards === 0 && stats.totalListsItems === 0 && stats.timelineCount === 0 && stats.episodesCount === 0) {
+                    return 'На текущем устройстве нет данных для переноса (история и закладки пусты).';
+                }
             }
             return null;
         },
 
         /**
-         * ЭТАП 7: Восстановление данных в новый аккаунт с гарантией синхронизации CUB
-         * mode: 'merge' (объединить без дубликатов) | 'replace' (заменить по согласию пользователя)
+         * Создание точки отката (Snapshot) перед восстановлением для атомарности операции
          */
-        restoreBackupToLocal: function (backupData, mode, onProgress) {
+        createRollbackSnapshot: function () {
+            return {
+                favorite: Utils.deepClone(Lampa.Storage.get('favorite', {})),
+                file_view: Utils.deepClone(Lampa.Storage.get('file_view', {})),
+                online_view: Utils.deepClone(Lampa.Storage.get('online_view', [])),
+                torrents_view: Utils.deepClone(Lampa.Storage.get('torrents_view', [])),
+                season_view: Utils.deepClone(Lampa.Storage.get('season_view', {}))
+            };
+        },
+
+        /**
+         * Восстановление из точки отката при возникновении ошибки
+         */
+        applyRollbackSnapshot: function (snapshot) {
+            if (!snapshot) return;
+            try {
+                Lampa.Storage.set('favorite', snapshot.favorite || {});
+                Lampa.Storage.set('file_view', snapshot.file_view || {});
+                Lampa.Storage.set('online_view', snapshot.online_view || []);
+                Lampa.Storage.set('torrents_view', snapshot.torrents_view || []);
+                Lampa.Storage.set('season_view', snapshot.season_view || {});
+                if (Lampa.Favorite && typeof Lampa.Favorite.init === 'function') Lampa.Favorite.init();
+                if (Lampa.Timeline && typeof Lampa.Timeline.init === 'function') Lampa.Timeline.init();
+            } catch (e) {
+                console.error('[HistoryTransfer] Критическая ошибка отката:', e);
+            }
+        },
+
+        /**
+         * Атомарное восстановление данных на новое устройство
+         * mode: 'merge' (Объединение) | 'replace' (Полная замена)
+         */
+        restoreArchive: function (archive, mode, onProgress) {
             var self = this;
             return new Promise(function (resolve, reject) {
+                var validationErr = self.validateArchive(archive, true);
+                if (validationErr) {
+                    reject(new Error(validationErr));
+                    return;
+                }
+
+                var rollbackSnapshot = self.createRollbackSnapshot();
+
                 try {
-                    var payload = backupData.payload;
-                    if (!payload || !payload.favorite) {
-                        reject(new Error('Некорректная структура резервной копии.'));
-                        return;
-                    }
+                    onProgress(10, 'Создание резервной точки отката...');
 
-                    onProgress(10, 'Подготовка структуры данных нового аккаунта...');
+                    var incomingData = archive.data;
+                    var incomingFav = incomingData.favorite;
 
-                    // Карта всех карточек из бэкапа по строковому ID
-                    var backupCardMap = {};
-                    var backupCards = Array.isArray(payload.favorite.card) ? payload.favorite.card : [];
-                    backupCards.forEach(function (c) {
+                    // Индексируем полные карточки из архива по ID
+                    var incomingCardMap = {};
+                    (incomingFav.card || []).forEach(function (c) {
                         if (c && c.id !== undefined && c.id !== null) {
-                            backupCardMap[String(c.id)] = Utils.deepClone(c);
+                            incomingCardMap[String(c.id)] = Utils.deepClone(c);
                         }
                     });
 
-                    // Определяем базовое состояние нового аккаунта в зависимости от выбранного режима
+                    // Подготавливаем целевую структуру favorite
                     var targetFav;
                     if (mode === 'replace') {
                         targetFav = { card: [] };
                         FAVORITE_LIST_KEYS.forEach(function (k) { targetFav[k] = []; });
                     } else {
-                        targetFav = self.readNormalizedFavorite();
+                        targetFav = self.readFavoriteData();
                     }
 
-                    // Индекс существующих карточек в целевом профиле
+                    // Индекс существующих карточек на новом устройстве
                     var targetCardIndex = {};
                     targetFav.card.forEach(function (c) {
                         if (c && c.id !== undefined && c.id !== null) {
@@ -419,10 +513,10 @@
                         }
                     });
 
-                    // 1. Переносим все недостающие полные объекты карточек из `card`
-                    onProgress(25, 'Перенос полных объектов карточек (' + backupCards.length + ')...');
+                    // 1. Добавляем недостающие полные объекты карточек
+                    onProgress(25, 'Перенос метаданных фильмов и сериалов...');
                     var addedCards = 0;
-                    backupCards.forEach(function (c) {
+                    (incomingFav.card || []).forEach(function (c) {
                         if (!c || c.id === undefined || c.id === null) return;
                         var idStr = String(c.id);
                         if (!targetCardIndex[idStr]) {
@@ -432,170 +526,186 @@
                         }
                     });
 
-                    // 2. Формируем очередь операций для нативного Lampa.Favorite.add(type, card),
-                    // чтобы CUB API получил уведомления о каждой добавленной записи и синхронизировал её в облако
-                    var syncQueue = [];
-                    var addedPerList = {};
+                    // 2. Формируем очередь добавления элементов через нативный Lampa.Favorite.add
+                    // для корректной работы UI и фоновой синхронизации текущего аккаунта CUB
+                    var syncTasks = [];
+                    var addedByList = {};
 
                     FAVORITE_LIST_KEYS.forEach(function (listKey) {
-                        addedPerList[listKey] = 0;
-                        var incomingIds = Array.isArray(payload.favorite[listKey]) ? payload.favorite[listKey] : [];
+                        addedByList[listKey] = 0;
+                        var incList = Array.isArray(incomingFav[listKey]) ? incomingFav[listKey] : [];
                         var existingSet = {};
                         targetFav[listKey].forEach(function (id) {
                             existingSet[String(id)] = true;
                         });
 
-                        // Собираем только новые уникальные ID
-                        var toAdd = [];
-                        incomingIds.forEach(function (id) {
+                        var uniqueNewIds = [];
+                        incList.forEach(function (id) {
                             var idStr = String(id);
                             if (!existingSet[idStr]) {
                                 existingSet[idStr] = true;
-                                toAdd.push(id);
+                                uniqueNewIds.push(id);
                             }
                         });
 
-                        // Обходим в обратном порядке, если будем добавлять через Lampa.Favorite.add (который делает unshift),
-                        // чтобы сохранить оригинальный порядок списка
-                        for (var i = toAdd.length - 1; i >= 0; i--) {
-                            var itemId = toAdd[i];
-                            var cardObj = backupCardMap[String(itemId)] || targetFav.card.find(function (x) {
+                        // Обходим с конца, так как Lampa.Favorite.add добавляет элемент в начало (unshift)
+                        for (var i = uniqueNewIds.length - 1; i >= 0; i--) {
+                            var itemId = uniqueNewIds[i];
+                            var fullCard = incomingCardMap[String(itemId)] || targetFav.card.find(function (x) {
                                 return String(x.id) === String(itemId);
                             });
 
-                            if (cardObj) {
-                                syncQueue.push({
-                                    type: listKey,
-                                    card: cardObj
-                                });
-                                addedPerList[listKey]++;
+                            if (fullCard) {
+                                syncTasks.push({ type: listKey, card: fullCard });
+                                addedByList[listKey]++;
                             } else {
-                                // Если карточка отсутствовала даже в старом card, сохраняем ID напрямую в список
                                 targetFav[listKey].push(itemId);
-                                addedPerList[listKey]++;
+                                addedByList[listKey]++;
                             }
                         }
                     });
 
-                    // Если выбран режим replace, сначала очищаем локальный favorite
-                    if (mode === 'replace') {
+                    // Сохраняем базовое состояние favorite (проверка квоты localStorage)
+                    try {
                         Lampa.Storage.set('favorite', targetFav);
-                        if (Lampa.Favorite && typeof Lampa.Favorite.init === 'function') {
-                            Lampa.Favorite.init();
-                        }
-                    } else {
-                        // В режиме merge предварительно записываем недостающие карточки в favorite.card
-                        Lampa.Storage.set('favorite', targetFav);
+                    } catch (quotaErr) {
+                        throw new Error('Недостаточно места в локальном хранилище устройства.');
                     }
 
-                    // 3. Пакетная запись через нативный Lampa.Favorite.add (гарантирует CUB Sync без 429 rate-limit)
-                    var totalQueue = syncQueue.length;
+                    if (mode === 'replace' && Lampa.Favorite && typeof Lampa.Favorite.init === 'function') {
+                        Lampa.Favorite.init();
+                    }
+
+                    // 3. Пакетное выполнение Lampa.Favorite.add (по 20 элементов за шаг)
+                    var totalTasks = syncTasks.length;
                     var batchSize = 20;
                     var cursor = 0;
 
-                    function processNextBatch() {
-                        if (cursor >= totalQueue) {
-                            finishTimelineAndSync();
-                            return;
-                        }
+                    function runNextBatch() {
+                        try {
+                            if (cursor >= totalTasks) {
+                                finalizeProgressAndSync();
+                                return;
+                            }
 
-                        var end = Math.min(cursor + batchSize, totalQueue);
-                        for (var idx = cursor; idx < end; idx++) {
-                            var task = syncQueue[idx];
-                            try {
+                            var end = Math.min(cursor + batchSize, totalTasks);
+                            for (var idx = cursor; idx < end; idx++) {
+                                var task = syncTasks[idx];
                                 if (Lampa.Favorite && typeof Lampa.Favorite.add === 'function') {
                                     Lampa.Favorite.add(task.type, task.card);
                                 } else {
-                                    var curFav = Lampa.Storage.get('favorite', {});
-                                    if (!Array.isArray(curFav[task.type])) curFav[task.type] = [];
-                                    if (curFav[task.type].indexOf(task.card.id) === -1) {
-                                        curFav[task.type].unshift(task.card.id);
+                                    var cur = Lampa.Storage.get('favorite', {});
+                                    if (!Array.isArray(cur[task.type])) cur[task.type] = [];
+                                    if (cur[task.type].indexOf(task.card.id) === -1) {
+                                        cur[task.type].unshift(task.card.id);
                                     }
-                                    Lampa.Storage.set('favorite', curFav);
+                                    Lampa.Storage.set('favorite', cur);
                                 }
-                            } catch (e) {
-                                console.warn('[HistoryTransfer] Ошибка добавления карточки:', e);
                             }
+
+                            cursor = end;
+                            var pct = 35 + Math.round((cursor / Math.max(totalTasks, 1)) * 45);
+                            onProgress(pct, 'Применение истории и закладок: ' + cursor + ' из ' + totalTasks + '...');
+                            setTimeout(runNextBatch, 100);
+                        } catch (batchErr) {
+                            self.applyRollbackSnapshot(rollbackSnapshot);
+                            reject(new Error('Ошибка восстановления: ' + (batchErr.message || 'сбой записи')));
                         }
-
-                        cursor = end;
-                        var pct = 35 + Math.round((cursor / Math.max(totalQueue, 1)) * 45);
-                        onProgress(pct, 'Синхронизация списков с Lampa/CUB: ' + cursor + ' из ' + totalQueue + '...');
-
-                        setTimeout(processNextBatch, 120);
                     }
 
-                    function finishTimelineAndSync() {
-                        onProgress(85, 'Восстановление таймкодов и просмотренных серий...');
-                        var mergedEpisodes = 0;
+                    function finalizeProgressAndSync() {
+                        try {
+                            onProgress(85, 'Восстановление прогресса просмотра и серий...');
+                            var mergedTimelineCount = 0;
 
-                        if (payload.timeline && typeof payload.timeline === 'object') {
-                            var currentTimeline = mode === 'replace' ? {} : (Lampa.Storage.get('file_view', {}) || {});
-                            Object.keys(payload.timeline).forEach(function (hash) {
-                                var inc = payload.timeline[hash];
-                                if (!inc || typeof inc !== 'object') return;
-                                var cur = currentTimeline[hash];
-                                if (!cur || Number(inc.percent || 0) > Number(cur.percent || 0)) {
-                                    currentTimeline[hash] = {
-                                        hash: inc.hash || hash,
-                                        percent: Number(inc.percent || 0),
-                                        time: Number(inc.time || 0),
-                                        duration: Number(inc.duration || 0)
-                                    };
-                                    mergedEpisodes++;
-                                }
+                            // Прогресс просмотра (file_view) — не перезаписываем более свежий прогресс устаревшим
+                            if (incomingData.timeline && typeof incomingData.timeline === 'object') {
+                                var currentTimeline = mode === 'replace' ? {} : (Lampa.Storage.get('file_view', {}) || {});
+                                Object.keys(incomingData.timeline).forEach(function (hash) {
+                                    var inc = incomingData.timeline[hash];
+                                    if (!inc || typeof inc !== 'object') return;
+                                    var cur = currentTimeline[hash];
+                                    if (!cur || Number(inc.percent || 0) > Number(cur.percent || 0)) {
+                                        currentTimeline[hash] = {
+                                            hash: inc.hash || hash,
+                                            percent: Number(inc.percent || 0),
+                                            time: Number(inc.time || 0),
+                                            duration: Number(inc.duration || 0)
+                                        };
+                                        mergedTimelineCount++;
+                                    }
+                                });
+                                Lampa.Storage.set('file_view', currentTimeline);
+                            }
+
+                            // Просмотренные серии (online_view, torrents_view)
+                            ['online_view', 'torrents_view'].forEach(function (key) {
+                                var incArr = Array.isArray(incomingData[key]) ? incomingData[key] : [];
+                                if (incArr.length === 0) return;
+                                var curArr = mode === 'replace' ? [] : (Lampa.Storage.get(key, []) || []);
+                                var seen = {};
+                                curArr.forEach(function (h) { seen[String(h)] = true; });
+                                incArr.forEach(function (h) {
+                                    if (!seen[String(h)]) {
+                                        curArr.push(h);
+                                        seen[String(h)] = true;
+                                        mergedTimelineCount++;
+                                    }
+                                });
+                                Lampa.Storage.set(key, curArr);
                             });
-                            Lampa.Storage.set('file_view', currentTimeline);
-                        }
 
-                        ['online_view', 'torrents_view'].forEach(function (viewKey) {
-                            var incArr = Array.isArray(payload[viewKey]) ? payload[viewKey] : [];
-                            if (incArr.length === 0) return;
-                            var curArr = mode === 'replace' ? [] : (Lampa.Storage.get(viewKey, []) || []);
-                            var set = {};
-                            curArr.forEach(function (h) { set[String(h)] = true; });
-                            incArr.forEach(function (h) {
-                                if (!set[String(h)]) {
-                                    curArr.push(h);
-                                    set[String(h)] = true;
-                                    mergedEpisodes++;
-                                }
+                            // Выбранные сезоны (season_view)
+                            if (incomingData.season_view && typeof incomingData.season_view === 'object') {
+                                var curSeasons = mode === 'replace' ? {} : (Lampa.Storage.get('season_view', {}) || {});
+                                Object.keys(incomingData.season_view).forEach(function (k) {
+                                    if (mode === 'replace' || curSeasons[k] === undefined) {
+                                        curSeasons[k] = incomingData.season_view[k];
+                                    }
+                                });
+                                Lampa.Storage.set('season_view', curSeasons);
+                            }
+
+                            onProgress(95, 'Обновление интерфейса Lampa и облачной синхронизации...');
+
+                            if (Lampa.Favorite && typeof Lampa.Favorite.init === 'function') {
+                                Lampa.Favorite.init();
+                            }
+                            if (Lampa.Timeline && typeof Lampa.Timeline.init === 'function') {
+                                Lampa.Timeline.init();
+                            }
+
+                            // Запуск синхронизации текущего аккаунта CUB (если пользователь авторизован)
+                            var autoSync = Lampa.Storage.get(STORAGE_KEYS.AUTO_SYNC_CUB, true);
+                            var acc = Lampa.Storage.get('account', {});
+                            var cubSynced = false;
+
+                            if (autoSync && acc && acc.token && Lampa.Account && typeof Lampa.Account.sync === 'function') {
+                                try {
+                                    Lampa.Account.sync();
+                                    cubSynced = true;
+                                } catch (e) {}
+                            }
+
+                            onProgress(100, 'Данные успешно восстановлены!');
+
+                            resolve({
+                                mode: mode,
+                                addedCards: addedCards,
+                                addedByList: addedByList,
+                                totalRestoredItems: totalTasks,
+                                mergedTimeline: mergedTimelineCount,
+                                cubSynced: cubSynced
                             });
-                            Lampa.Storage.set(viewKey, curArr);
-                        });
-
-                        onProgress(95, 'Обновление интерфейса Lampa и отправка в облако CUB...');
-
-                        if (Lampa.Favorite && typeof Lampa.Favorite.init === 'function') {
-                            Lampa.Favorite.init();
+                        } catch (finErr) {
+                            self.applyRollbackSnapshot(rollbackSnapshot);
+                            reject(new Error('Ошибка восстановления (выполнен безопасный откат): ' + finErr.message));
                         }
-                        if (Lampa.Timeline && typeof Lampa.Timeline.init === 'function') {
-                            Lampa.Timeline.init();
-                        }
-
-                        var autoSyncCub = Lampa.Storage.get(STORAGE_KEYS.AUTO_SYNC_CUB, true);
-                        var cubAccount = Utils.getCurrentLampaAccountInfo();
-
-                        if (autoSyncCub && cubAccount.authorized && Lampa.Account && typeof Lampa.Account.sync === 'function') {
-                            try {
-                                Lampa.Account.sync();
-                            } catch (e) {}
-                        }
-
-                        onProgress(100, 'Перенос успешно завершён!');
-
-                        resolve({
-                            mode: mode,
-                            addedCards: addedCards,
-                            addedPerList: addedPerList,
-                            totalSyncedItems: totalQueue,
-                            mergedEpisodes: mergedEpisodes,
-                            cubSynced: autoSyncCub && cubAccount.authorized
-                        });
                     }
 
-                    processNextBatch();
+                    runNextBatch();
                 } catch (err) {
+                    self.applyRollbackSnapshot(rollbackSnapshot);
                     reject(err);
                 }
             });
@@ -604,58 +714,69 @@
 
     /**
      * ========================================================================
-     * СТИЛИ ИНТЕРФЕЙСА LAMPA
+     * СТИЛИ ИНТЕРФЕЙСА В ДИЗАЙН-СИСТЕМЕ LAMPA (SMART TV / ANDROID TV / WEB)
      * ========================================================================
      */
     function injectStyles() {
-        if (document.getElementById('ht-plugin-styles')) return;
+        if (document.getElementById('ht-v2-styles')) return;
         var css = [
             '.ht-modal { padding: 1.5em; max-width: 54em; margin: 0 auto; color: #fff; }',
-            '.ht-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.12); padding-bottom: 1em; margin-bottom: 1.2em; }',
+            '.ht-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(255,255,255,0.12); padding-bottom: 0.9em; margin-bottom: 1.1em; }',
             '.ht-title { font-size: 1.45em; font-weight: 700; letter-spacing: 0.02em; }',
             '.ht-badge { background: rgba(255,255,255,0.12); padding: 0.35em 0.75em; border-radius: 0.5em; font-size: 0.85em; color: #ddd; }',
             '.ht-badge--ok { background: rgba(46, 204, 113, 0.22); color: #2ecc71; border: 1px solid rgba(46, 204, 113, 0.4); }',
             '.ht-badge--warn { background: rgba(241, 196, 15, 0.2); color: #f1c40f; border: 1px solid rgba(241, 196, 15, 0.35); }',
-            '.ht-status-card { background: rgba(255,255,255,0.06); border-radius: 0.8em; padding: 1em 1.2em; margin-bottom: 1.2em; display: flex; flex-wrap: wrap; gap: 1em; justify-content: space-between; }',
-            '.ht-stat-box { flex: 1 1 30%; min-width: 10em; }',
-            '.ht-stat-label { font-size: 0.8em; color: rgba(255,255,255,0.55); margin-bottom: 0.25em; }',
-            '.ht-stat-val { font-size: 1.1em; font-weight: 600; }',
-            '.ht-menu-list { display: flex; flex-direction: column; gap: 0.65em; }',
-            '.ht-menu-item { display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.07); padding: 1em 1.25em; border-radius: 0.75em; transition: transform 0.15s ease, background 0.15s ease; border: 2px solid transparent; cursor: pointer; }',
+            '.ht-code-box { background: rgba(255,255,255,0.08); border: 2px solid rgba(46, 204, 113, 0.5); border-radius: 0.9em; padding: 1.4em; text-align: center; margin: 1em 0; }',
+            '.ht-code-label { font-size: 0.95em; color: rgba(255,255,255,0.75); margin-bottom: 0.4em; }',
+            '.ht-code-value { font-size: 2.8em; font-weight: 800; letter-spacing: 0.14em; color: #2ecc71; margin: 0.2em 0; font-family: monospace; }',
+            '.ht-code-timer { font-size: 1em; color: #f1c40f; font-weight: 600; margin-top: 0.4em; }',
+            '.ht-menu-list { display: flex; flex-direction: column; gap: 0.6em; }',
+            '.ht-menu-item { display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.07); padding: 0.95em 1.2em; border-radius: 0.75em; transition: transform 0.15s ease, background 0.15s ease; border: 2px solid transparent; cursor: pointer; }',
             '.ht-menu-item.focus, .ht-menu-item:hover { background: rgba(255,255,255,0.16); border-color: #fff; transform: scale(1.01); }',
             '.ht-menu-left { display: flex; align-items: center; gap: 0.9em; }',
-            '.ht-menu-icon { font-size: 1.4em; width: 1.5em; text-align: center; }',
-            '.ht-menu-text-title { font-size: 1.05em; font-weight: 600; letter-spacing: 0.03em; }',
+            '.ht-menu-icon { font-size: 1.35em; width: 1.5em; text-align: center; }',
+            '.ht-menu-text-title { font-size: 1.05em; font-weight: 600; }',
             '.ht-menu-text-desc { font-size: 0.82em; color: rgba(255,255,255,0.6); margin-top: 0.2em; }',
             '.ht-menu-arrow { font-size: 1.1em; opacity: 0.6; }',
             '.ht-progress-wrap { background: rgba(255,255,255,0.08); border-radius: 0.75em; padding: 1.2em; margin: 1em 0; }',
-            '.ht-progress-bar-bg { width: 100%; height: 0.6em; background: rgba(255,255,255,0.15); border-radius: 1em; overflow: hidden; margin: 0.75em 0; }',
+            '.ht-progress-bar-bg { width: 100%; height: 0.65em; background: rgba(255,255,255,0.15); border-radius: 1em; overflow: hidden; margin: 0.75em 0; }',
             '.ht-progress-bar-fill { height: 100%; background: #2ecc71; width: 0%; transition: width 0.25s ease; }',
-            '.ht-btn-row { display: flex; gap: 0.8em; margin-top: 1.2em; flex-wrap: wrap; }',
-            '.ht-btn { background: rgba(255,255,255,0.12); color: #fff; padding: 0.8em 1.3em; border-radius: 0.6em; font-weight: 600; border: 2px solid transparent; cursor: pointer; text-align: center; flex: 1 1 auto; }',
+            '.ht-btn-row { display: flex; gap: 0.8em; margin-top: 1.1em; flex-wrap: wrap; }',
+            '.ht-btn { background: rgba(255,255,255,0.12); color: #fff; padding: 0.8em 1.2em; border-radius: 0.6em; font-weight: 600; border: 2px solid transparent; cursor: pointer; text-align: center; flex: 1 1 auto; }',
             '.ht-btn.focus, .ht-btn:hover { background: #fff; color: #111; border-color: #fff; }',
+            '.ht-btn--primary { background: rgba(46, 204, 113, 0.25); color: #2ecc71; border-color: rgba(46, 204, 113, 0.4); }',
+            '.ht-btn--primary.focus, .ht-btn--primary:hover { background: #2ecc71; color: #111; border-color: #2ecc71; }',
             '.ht-btn--danger { background: rgba(231, 76, 60, 0.25); color: #ff7675; }',
             '.ht-btn--danger.focus, .ht-btn--danger:hover { background: #e74c3c; color: #fff; border-color: #e74c3c; }',
-            '.ht-info-table { width: 100%; border-collapse: collapse; margin: 0.8em 0; font-size: 0.9em; }',
+            '.ht-info-table { width: 100%; border-collapse: collapse; margin: 0.7em 0; font-size: 0.9em; }',
             '.ht-info-table td, .ht-info-table th { padding: 0.5em 0.4em; border-bottom: 1px solid rgba(255,255,255,0.08); text-align: left; }',
             '.ht-info-table th { color: rgba(255,255,255,0.55); font-weight: 500; }',
-            '.ht-grid-8 { display: grid; grid-template-columns: repeat(auto-fit, minmax(11em, 1fr)); gap: 0.5em; margin: 0.8em 0; }',
-            '.ht-grid-cell { background: rgba(255,255,255,0.05); padding: 0.55em 0.75em; border-radius: 0.5em; display: flex; justify-content: space-between; font-size: 0.85em; }'
+            '.ht-warn-box { background: rgba(231, 76, 60, 0.18); border: 1px solid rgba(231, 76, 60, 0.45); border-radius: 0.7em; padding: 0.9em 1.1em; margin: 0.8em 0; color: #ff9f9b; font-size: 0.9em; line-height: 1.45; }'
         ].join('\n');
 
         var style = document.createElement('style');
-        style.id = 'ht-plugin-styles';
+        style.id = 'ht-v2-styles';
         style.textContent = css;
         document.head.appendChild(style);
     }
 
     /**
      * ========================================================================
-     * ПОЛЬЗОВАТЕЛЬСКИЙ ИНТЕРФЕЙС
+     * ПОЛЬЗОВАТЕЛЬСКИЙ ИНТЕРФЕЙС (6 РАЗДЕЛОВ)
      * ========================================================================
      */
     var UI = {
+        activeTimerInterval: null,
+
+        clearTimer: function () {
+            if (this.activeTimerInterval) {
+                clearInterval(this.activeTimerInterval);
+                this.activeTimerInterval = null;
+            }
+        },
+
         openScreen: function (htmlContent, onReady, onBackCallback) {
+            this.clearTimer();
             var wrap = $('<div class="ht-modal">' + htmlContent + '</div>');
 
             Lampa.Modal.open({
@@ -663,6 +784,7 @@
                 html: wrap,
                 size: 'medium',
                 onBack: function () {
+                    UI.clearTimer();
                     Lampa.Modal.close();
                     if (typeof onBackCallback === 'function') {
                         onBackCallback();
@@ -681,92 +803,74 @@
         },
 
         /**
-         * ГЛАВНОЕ МЕНЮ
+         * РАЗДЕЛ 1: ПЕРЕНОС ДАННЫХ (ГЛАВНОЕ МЕНЮ)
          */
         openMainMenu: function () {
             var self = this;
-            var isAuth = Utils.isAuthorized();
-            var user = Utils.getUser();
-            var lampaAcc = Utils.getCurrentLampaAccountInfo();
-            var localFav = TransferEngine.readNormalizedFavorite();
-            var localStats = TransferEngine.getFavoriteStats(localFav);
-
-            var authBadge = isAuth
-                ? '<span class="ht-badge ht-badge--ok">● ' + Utils.escapeHtml(user.username) + '</span>'
-                : '<span class="ht-badge ht-badge--warn">Не выполнен вход</span>';
+            var stats = DataEngine.collectStats();
 
             var html = [
                 '<div class="ht-header">',
-                '  <div class="ht-title">' + PLUGIN_NAME + '</div>',
-                '  <div>' + authBadge + '</div>',
+                '  <div class="ht-title">🔄 ' + PLUGIN_NAME + ' — Перенос данных</div>',
+                '  <span class="ht-badge">v' + PLUGIN_VERSION + '</span>',
                 '</div>',
 
-                '<div class="ht-status-card">',
-                '  <div class="ht-stat-box">',
-                '    <div class="ht-stat-label">Текущий профиль Lampa</div>',
-                '    <div class="ht-stat-val">' + Utils.escapeHtml(lampaAcc.label) + '</div>',
-                '  </div>',
-                '  <div class="ht-stat-box">',
-                '    <div class="ht-stat-label">История / Карточки (card)</div>',
-                '    <div class="ht-stat-val">' + localStats.byList.history + ' в истории / ' + localStats.cards + ' карт.</div>',
-                '  </div>',
-                '  <div class="ht-stat-box">',
-                '    <div class="ht-stat-label">Облачный бэкап</div>',
-                '    <div class="ht-stat-val" id="ht-cloud-quick-status">' + (isAuth ? 'Проверка...' : 'Требуется вход') + '</div>',
-                '  </div>',
-                '</div>',
+                '<p style="color:rgba(255,255,255,0.75);font-size:0.92em;margin-bottom:1em;">',
+                '  Перенос истории просмотров, закладок, списков и прогресса серий между устройствами по одноразовому коду. ',
+                '  На устройстве найдено: <strong>' + stats.cards + '</strong> карточек, <strong>' + stats.byList.history + '</strong> в истории, <strong>' + stats.timelineCount + '</strong> таймкодов.',
+                '</p>',
 
                 '<div class="ht-menu-list">',
-                '  <div class="ht-menu-item selector" data-action="save">',
+                '  <div class="ht-menu-item selector" data-nav="create_code">',
                 '    <div class="ht-menu-left">',
                 '      <div class="ht-menu-icon">📤</div>',
                 '      <div>',
-                '        <div class="ht-menu-text-title">СОХРАНИТЬ ИСТОРИЮ</div>',
-                '        <div class="ht-menu-text-desc">Экспортировать все 9 разделов профиля (card, history, статусы, закладки) и серии</div>',
+                '        <div class="ht-menu-text-title">Создать код переноса</div>',
+                '        <div class="ht-menu-text-desc">Для старого устройства: подготовить данные и получить одноразовый код на 15 минут</div>',
                 '      </div>',
                 '    </div>',
                 '    <div class="ht-menu-arrow">❯</div>',
                 '  </div>',
 
-                '  <div class="ht-menu-item selector" data-action="restore">',
+                '  <div class="ht-menu-item selector" data-nav="restore_data">',
                 '    <div class="ht-menu-left">',
                 '      <div class="ht-menu-icon">📥</div>',
                 '      <div>',
-                '        <div class="ht-menu-text-title">ВОССТАНОВИТЬ ИСТОРИЮ</div>',
-                '        <div class="ht-menu-text-desc">Проверить бэкап и перенести данные в текущий аккаунт Lampa/CUB</div>',
+                '        <div class="ht-menu-text-title">Восстановить данные</div>',
+                '        <div class="ht-menu-text-desc">Для нового устройства: ввести код переноса или загрузить резервный JSON-файл</div>',
                 '      </div>',
                 '    </div>',
                 '    <div class="ht-menu-arrow">❯</div>',
                 '  </div>',
 
-                '  <div class="ht-menu-item selector" data-action="account">',
+                '  <div class="ht-menu-item selector" data-nav="info">',
                 '    <div class="ht-menu-left">',
-                '      <div class="ht-menu-icon">👤</div>',
+                '      <div class="ht-menu-icon">📊</div>',
                 '      <div>',
-                '        <div class="ht-menu-text-title">МОЙ АККАУНТ</div>',
-                '        <div class="ht-menu-text-desc">Вход, регистрация и журнал операций History Transfer</div>',
+                '        <div class="ht-menu-text-title">Информация о переносе</div>',
+                '        <div class="ht-menu-text-desc">Детальная статистика данных и локальное резервное копирование в JSON-файл</div>',
                 '      </div>',
                 '    </div>',
                 '    <div class="ht-menu-arrow">❯</div>',
                 '  </div>',
 
-                '  <div class="ht-menu-item selector" data-action="cloud">',
+                '  <div class="ht-menu-item selector" data-nav="logs">',
                 '    <div class="ht-menu-left">',
-                '      <div class="ht-menu-icon">☁️</div>',
+                '      <div class="ht-menu-icon">🕒</div>',
                 '      <div>',
-                '        <div class="ht-menu-text-title">ОБЛАЧНОЕ ХРАНИЛИЩЕ</div>',
-                '        <div class="ht-menu-text-desc">Состояние облачной копии, контрольная сумма и очистка</div>',
+                '        <div class="ht-menu-text-title">История операций</div>',
+                '        <div class="ht-menu-text-desc">Журнал выполненных отправок и восстановлений на этом устройстве</div>',
                 '      </div>',
                 '    </div>',
                 '    <div class="ht-menu-arrow">❯</div>',
                 '  </div>',
 
-                '  <div class="ht-menu-item selector" data-action="settings">',
+                '  <div class="ht-menu-item selector" data-nav="settings">',
                 '    <div class="ht-menu-left">',
                 '      <div class="ht-menu-icon">⚙️</div>',
                 '      <div>',
-                '        <div class="ht-menu-text-title">НАСТРОЙКИ</div>',
-                '        <div class="ht-menu-text-desc">Адрес API Cloudflare Workers и параметры синхронизации</div>',
+                '        <div class="ht-menu-text-title">Настройки</div>',
+                '        <div class="ht-menu-text-desc">Адрес облачного сервера, проверка связи и параметры синхронизации</div>',
                 '      </div>',
                 '    </div>',
                 '    <div class="ht-menu-arrow">❯</div>',
@@ -776,488 +880,648 @@
 
             this.openScreen(html, function (wrap) {
                 wrap.find('.ht-menu-item').on('hover:enter click', function () {
-                    var action = $(this).data('action');
-                    if (action === 'save') self.handleExportFlow();
-                    else if (action === 'restore') self.prepareImportFlow();
-                    else if (action === 'account') self.openAccountScreen();
-                    else if (action === 'cloud') self.openCloudStorageScreen();
-                    else if (action === 'settings') self.openSettingsScreen();
+                    var nav = $(this).data('nav');
+                    if (nav === 'create_code') self.openCreateCodeScreen();
+                    else if (nav === 'restore_data') self.openRestoreMenuScreen();
+                    else if (nav === 'info') self.openTransferInfoScreen();
+                    else if (nav === 'logs') self.openOperationsHistoryScreen();
+                    else if (nav === 'settings') self.openSettingsScreen();
                 });
-
-                if (isAuth) {
-                    ApiClient.getBackupStatus()
-                        .then(function (res) {
-                            var el = wrap.find('#ht-cloud-quick-status');
-                            if (res.exists && res.backup) {
-                                el.text('Доступен (' + res.backup.history_count + ' в истории)');
-                            } else {
-                                el.text('Пусто (нет копии)');
-                            }
-                        })
-                        .catch(function () {
-                            wrap.find('#ht-cloud-quick-status').text('Ошибка связи с API');
-                        });
-                }
             });
         },
 
         /**
-         * ЭКСПОРТ ИСТОРИИ (ВСЕ 9 ПОЛЕЙ + TIMELINE)
+         * РАЗДЕЛ 2: СОЗДАТЬ КОД (СТАРОЕ УСТРОЙСТВО)
          */
-        handleExportFlow: function () {
+        openCreateCodeScreen: function () {
             var self = this;
-            if (!Utils.isAuthorized()) {
-                Utils.notify('Сначала войдите или зарегистрируйтесь в «Мой аккаунт»', true);
-                this.openAccountScreen(function () { self.handleExportFlow(); });
-                return;
-            }
 
-            var html = [
+            var loadingHtml = [
                 '<div class="ht-header">',
-                '  <div class="ht-title">📤 Сохранение истории</div>',
-                '  <span class="ht-badge">Экспорт</span>',
+                '  <div class="ht-title">СОЗДАНИЕ ПЕРЕНОСА</div>',
+                '  <span class="ht-badge">Подготовка</span>',
                 '</div>',
                 '<div class="ht-progress-wrap">',
-                '  <div id="ht-export-step">Сбор всех разделов профиля Lampa...</div>',
-                '  <div class="ht-progress-bar-bg"><div class="ht-progress-bar-fill" id="ht-export-bar"></div></div>',
-                '  <div id="ht-export-details" style="font-size:0.85em;color:rgba(255,255,255,0.65);"></div>',
-                '</div>',
-                '<div id="ht-export-breakdown"></div>',
-                '<div class="ht-btn-row" id="ht-export-actions" style="display:none;">',
-                '  <div class="ht-btn selector" data-act="back">Вернуться в меню</div>',
+                '  <div id="ht-create-step">Сбор пользовательских данных Lampa...</div>',
+                '  <div class="ht-progress-bar-bg"><div class="ht-progress-bar-fill" id="ht-create-bar"></div></div>',
+                '  <div id="ht-create-sub" style="font-size:0.85em;color:rgba(255,255,255,0.65);">Не закрывайте окно...</div>',
                 '</div>'
             ].join('');
 
-            this.openScreen(html, function (wrap) {
-                var setProgress = function (pct, text, details) {
-                    wrap.find('#ht-export-bar').css('width', pct + '%');
-                    wrap.find('#ht-export-step').text(text);
-                    if (details !== undefined) wrap.find('#ht-export-details').text(details);
-                };
-
-                var finish = function () {
-                    wrap.find('#ht-export-actions').show();
-                    Lampa.Controller.collectionSet(wrap);
-                    var btn = wrap.find('.selector').first()[0];
-                    if (btn) Lampa.Controller.collectionFocus(btn, wrap);
-                    wrap.find('[data-act="back"]').on('hover:enter click', function () { self.openMainMenu(); });
+            this.openScreen(loadingHtml, function (wrap) {
+                var setStep = function (pct, step, sub) {
+                    wrap.find('#ht-create-bar').css('width', pct + '%');
+                    wrap.find('#ht-create-step').text(step);
+                    if (sub !== undefined) wrap.find('#ht-create-sub').text(sub);
                 };
 
                 setTimeout(function () {
-                    setProgress(25, 'Чтение card, history, book, like, wath, viewed, scheduled, continued, thrown...');
-                    var payload = TransferEngine.collectLocalHistory();
-                    var validationError = TransferEngine.validateBeforeUpload(payload);
+                    try {
+                        setStep(25, 'Сбор истории, закладок, списков и прогресса серий...');
+                        var archive = DataEngine.buildExportArchive();
+                        var errMsg = DataEngine.validateArchive(archive, false);
 
-                    if (validationError) {
-                        wrap.find('#ht-export-bar').css('background', '#e74c3c');
-                        setProgress(100, 'Экспорт невозможен', validationError);
-                        Utils.notify(validationError, true);
-                        finish();
-                        return;
+                        if (errMsg) {
+                            throw new Error(errMsg);
+                        }
+
+                        setStep(55, 'Проверка целостности и вычисление SHA-256...');
+                        var serialized = JSON.stringify(archive);
+
+                        Utils.sha256(serialized).then(function (checksum) {
+                            setStep(80, 'Загрузка архива в облачное хранилище...');
+                            return ApiClient.createTransfer(archive, checksum);
+                        }).then(function (res) {
+                            var totalItems = (res.summary.history || 0) + (res.summary.book || 0) + (res.summary.viewed || 0);
+                            Utils.logOperation('Создание кода переноса', 'Код ' + res.formatted_code, totalItems, 'Успешно');
+                            Lampa.Storage.set(STORAGE_KEYS.LAST_ACTIVE_CODE, {
+                                code: res.code,
+                                delete_secret: res.delete_secret,
+                                expires_at: res.expires_at
+                            });
+
+                            self.renderGeneratedCodeScreen(res);
+                        }).catch(function (err) {
+                            wrap.find('#ht-create-bar').css('background', '#e74c3c');
+                            setStep(100, 'Ошибка создания переноса', err.message || 'Сервер временно недоступен');
+                            Utils.notify(err.message || 'Ошибка создания кода', true);
+                            wrap.append('<div class="ht-btn-row"><div class="ht-btn selector" data-back="1">Вернуться в меню</div></div>');
+                            Lampa.Controller.collectionSet(wrap);
+                            var btn = wrap.find('.selector').first()[0];
+                            if (btn) Lampa.Controller.collectionFocus(btn, wrap);
+                            wrap.find('[data-back="1"]').on('hover:enter click', function () { self.openMainMenu(); });
+                        });
+                    } catch (e) {
+                        wrap.find('#ht-create-bar').css('background', '#e74c3c');
+                        setStep(100, 'Ошибка подготовки данных', e.message);
+                        Utils.notify(e.message, true);
+                        wrap.append('<div class="ht-btn-row"><div class="ht-btn selector" data-back="1">Вернуться в меню</div></div>');
+                        Lampa.Controller.collectionSet(wrap);
+                        var btn = wrap.find('.selector').first()[0];
+                        if (btn) Lampa.Controller.collectionFocus(btn, wrap);
+                        wrap.find('[data-back="1"]').on('hover:enter click', function () { self.openMainMenu(); });
                     }
-
-                    // Отрисовываем сводку по всем 8 спискам и карточкам
-                    var gridHtml = '<div class="ht-grid-8">' +
-                        '<div class="ht-grid-cell"><span>Карточки (card)</span><strong>' + payload.favorite.card.length + '</strong></div>';
-                    FAVORITE_LIST_KEYS.forEach(function (k) {
-                        gridHtml += '<div class="ht-grid-cell"><span>' + LIST_LABELS[k] + '</span><strong>' + payload.favorite[k].length + '</strong></div>';
-                    });
-                    gridHtml += '</div>';
-                    wrap.find('#ht-export-breakdown').html(gridHtml);
-
-                    setProgress(60, 'Вычисление SHA-256 и отправка в Cloudflare D1...');
-                    var payloadStr = JSON.stringify(payload);
-
-                    Utils.sha256(payloadStr).then(function (checksum) {
-                        return ApiClient.uploadBackup(payload, checksum, payload.source_account.label);
-                    }).then(function (res) {
-                        var b = res.backup;
-                        setProgress(
-                            100,
-                            'Резервная копия успешно сохранена!',
-                            'Полных карточек: ' + b.cards_count + ' | Истории: ' + b.history_count +
-                            ' | Таймкодов: ' + b.episodes_count + ' (' + Utils.formatBytes(b.size_bytes) + ')'
-                        );
-                        Utils.notify('История и все списки успешно сохранены!');
-                        finish();
-                    }).catch(function (err) {
-                        wrap.find('#ht-export-bar').css('background', '#e74c3c');
-                        setProgress(100, 'Ошибка при сохранении', err.message || 'Сбой сети');
-                        Utils.notify(err.message || 'Ошибка экспорта', true);
-                        finish();
-                    });
                 }, 150);
             }, function () { self.openMainMenu(); });
         },
 
-        /**
-         * ПРЕДВАРИТЕЛЬНАЯ ПРОВЕРКА ПЕРЕД ИМПОРТОМ И ПОЛУЧЕНИЕ СОГЛАСИЯ ПОЛЬЗОВАТЕЛЯ (п. 5)
-         */
-        prepareImportFlow: function () {
+        renderGeneratedCodeScreen: function (transferRes) {
             var self = this;
-            if (!Utils.isAuthorized()) {
-                Utils.notify('Сначала авторизуйтесь в системе History Transfer', true);
-                this.openAccountScreen(function () { self.prepareImportFlow(); });
-                return;
-            }
-
-            var htmlLoading = [
-                '<div class="ht-header">',
-                '  <div class="ht-title">📥 Подготовка к восстановлению</div>',
-                '  <span class="ht-badge">Анализ</span>',
-                '</div>',
-                '<p style="color:rgba(255,255,255,0.75);">Загрузка метаданных резервной копии и сравнение с текущим аккаунтом...</p>'
-            ].join('');
-
-            this.openScreen(htmlLoading, function () {
-                ApiClient.downloadBackup()
-                    .then(function (res) {
-                        var backup = res.backup;
-                        if (Number(backup.schema_version) > SCHEMA_VERSION) {
-                            throw new Error('Версия резервной копии новее текущей версии плагина. Обновите плагин.');
-                        }
-
-                        var localFav = TransferEngine.readNormalizedFavorite();
-                        var localStats = TransferEngine.getFavoriteStats(localFav);
-                        var backupStats = TransferEngine.getFavoriteStats(backup.payload.favorite || {});
-                        var targetAcc = Utils.getCurrentLampaAccountInfo();
-
-                        var rowsHtml = FAVORITE_LIST_KEYS.map(function (k) {
-                            return '<tr><td>' + LIST_LABELS[k] + '</td><td>' + backupStats.byList[k] + '</td><td>' + localStats.byList[k] + '</td></tr>';
-                        }).join('');
-
-                        var confirmHtml = [
-                            '<div class="ht-header">',
-                            '  <div class="ht-title">📥 Подтверждение восстановления</div>',
-                            '  <span class="ht-badge ht-badge--ok">Копия готова</span>',
-                            '</div>',
-                            '<p style="font-size:0.9em;color:rgba(255,255,255,0.75);margin-bottom:0.8em;">',
-                            '  Источник: <strong>' + Utils.escapeHtml(backup.source_account_label) + '</strong> (' + Utils.formatDate(backup.updated_at) + ')<br>',
-                            '  Целевой профиль: <strong>' + Utils.escapeHtml(targetAcc.label) + '</strong>',
-                            '</p>',
-                            '<table class="ht-info-table">',
-                            '  <thead><tr><th>Раздел</th><th>В облаке (бэкап)</th><th>Сейчас на аккаунте</th></tr></thead>',
-                            '  <tbody>',
-                            '    <tr><td><strong>Полные карточки (card)</strong></td><td><strong>' + backupStats.cards + '</strong></td><td><strong>' + localStats.cards + '</strong></td></tr>',
-                            rowsHtml,
-                            '  </tbody>',
-                            '</table>',
-                            '<div class="ht-menu-list" style="margin-top:1em;">',
-                            '  <div class="ht-menu-item selector" data-mode="merge">',
-                            '    <div class="ht-menu-left">',
-                            '      <div class="ht-menu-icon">🔀</div>',
-                            '      <div>',
-                            '        <div class="ht-menu-text-title">Объединить без дубликатов (Рекомендуется)</div>',
-                            '        <div class="ht-menu-text-desc">Сохранить существующие записи нового аккаунта и добавить отсутствующие из копии</div>',
-                            '      </div>',
-                            '    </div>',
-                            '    <div class="ht-menu-arrow">❯</div>',
-                            '  </div>',
-                            '  <div class="ht-menu-item selector" data-mode="replace">',
-                            '    <div class="ht-menu-left">',
-                            '      <div class="ht-menu-icon">♻️</div>',
-                            '      <div>',
-                            '        <div class="ht-menu-text-title">Заменить данные нового аккаунта</div>',
-                            '        <div class="ht-menu-text-desc">Полностью перезаписать списки текущего аккаунта данными из резервной копии</div>',
-                            '      </div>',
-                            '    </div>',
-                            '    <div class="ht-menu-arrow">❯</div>',
-                            '  </div>',
-                            '</div>',
-                            '<div class="ht-btn-row">',
-                            '  <div class="ht-btn selector" data-mode="cancel">Отмена</div>',
-                            '</div>'
-                        ].join('');
-
-                        self.openScreen(confirmHtml, function (wrap) {
-                            wrap.find('[data-mode="merge"]').on('hover:enter click', function () {
-                                self.executeImportFlow(backup, 'merge');
-                            });
-                            wrap.find('[data-mode="replace"]').on('hover:enter click', function () {
-                                self.executeImportFlow(backup, 'replace');
-                            });
-                            wrap.find('[data-mode="cancel"]').on('hover:enter click', function () {
-                                self.openMainMenu();
-                            });
-                        }, function () { self.openMainMenu(); });
-                    })
-                    .catch(function (err) {
-                        Utils.notify(err.message || 'Не удалось получить резервную копию', true);
-                        self.openMainMenu();
-                    });
-            }, function () { self.openMainMenu(); });
-        },
-
-        /**
-         * ВЫПОЛНЕНИЕ ИМПОРТА С ОТОБРАЖЕНИЕМ ПРОГРЕССА
-         */
-        executeImportFlow: function (backup, mode) {
-            var self = this;
-            var targetAcc = Utils.getCurrentLampaAccountInfo();
+            var s = transferRes.summary || {};
 
             var html = [
                 '<div class="ht-header">',
-                '  <div class="ht-title">📥 Восстановление истории</div>',
-                '  <span class="ht-badge">' + (mode === 'replace' ? 'Замена' : 'Слияние') + '</span>',
+                '  <div class="ht-title">СОЗДАНИЕ ПЕРЕНОСА</div>',
+                '  <span class="ht-badge ht-badge--ok">Одноразовый код</span>',
                 '</div>',
-                '<div class="ht-progress-wrap">',
-                '  <div id="ht-import-step">Инициализация переноса...</div>',
-                '  <div class="ht-progress-bar-bg"><div class="ht-progress-bar-fill" id="ht-import-bar"></div></div>',
-                '  <div id="ht-import-details" style="font-size:0.85em;color:rgba(255,255,255,0.65);">Не закрывайте Lampa до завершения синхронизации.</div>',
+                '<div class="ht-code-box">',
+                '  <div class="ht-code-label">Ваши данные подготовлены!</div>',
+                '  <div class="ht-code-value">' + Utils.escapeHtml(transferRes.formatted_code) + '</div>',
+                '  <div class="ht-code-timer" id="ht-code-countdown">Срок действия: 15 минут</div>',
                 '</div>',
-                '<div id="ht-import-result-grid"></div>',
-                '<div class="ht-btn-row" id="ht-import-actions" style="display:none;">',
-                '  <div class="ht-btn selector" data-act="back">Готово (в главное меню)</div>',
+                '<p style="font-size:0.88em;color:rgba(255,255,255,0.7);text-align:center;">',
+                '  Упаковано: <strong>' + (s.cards || 0) + '</strong> карточек • <strong>' + (s.history || 0) + '</strong> в истории • ',
+                '  <strong>' + (s.book || 0) + '</strong> закладок • <strong>' + (s.timeline || 0) + '</strong> таймкодов (' + Utils.formatBytes(transferRes.size_bytes) + ')',
+                '</p>',
+                '<div class="ht-btn-row">',
+                '  <div class="ht-btn ht-btn--primary selector" data-code-act="copy">Скопировать код</div>',
+                '  <div class="ht-btn ht-btn--danger selector" data-code-act="cancel">Отменить и удалить</div>',
+                '  <div class="ht-btn selector" data-code-act="done">Готово</div>',
                 '</div>'
             ].join('');
 
             this.openScreen(html, function (wrap) {
-                var setProgress = function (pct, text, details) {
-                    wrap.find('#ht-import-bar').css('width', pct + '%');
-                    wrap.find('#ht-import-step').text(text);
-                    if (details !== undefined) wrap.find('#ht-import-details').text(details);
-                };
-
-                var finish = function () {
-                    wrap.find('#ht-import-actions').show();
-                    Lampa.Controller.collectionSet(wrap);
-                    var btn = wrap.find('.selector').first()[0];
-                    if (btn) Lampa.Controller.collectionFocus(btn, wrap);
-                    wrap.find('[data-act="back"]').on('hover:enter click', function () { self.openMainMenu(); });
-                };
-
-                TransferEngine.restoreBackupToLocal(backup, mode, function (pct, msg) {
-                    setProgress(pct, msg);
-                }).then(function (stats) {
-                    ApiClient.confirmImport(targetAcc.label, stats.totalSyncedItems + stats.mergedEpisodes).catch(function () {});
-
-                    var gridHtml = '<div class="ht-grid-8">' +
-                        '<div class="ht-grid-cell"><span>Добавлено карточек</span><strong>+' + stats.addedCards + '</strong></div>';
-                    FAVORITE_LIST_KEYS.forEach(function (k) {
-                        gridHtml += '<div class="ht-grid-cell"><span>' + LIST_LABELS[k] + '</span><strong>+' + (stats.addedPerList[k] || 0) + '</strong></div>';
-                    });
-                    gridHtml += '</div>';
-                    wrap.find('#ht-import-result-grid').html(gridHtml);
-
-                    var syncNote = stats.cubSynced
-                        ? 'Синхронизация с облаком CUB запущена.'
-                        : 'Данные сохранены в профиле Lampa.';
-
-                    setProgress(
-                        100,
-                        'Восстановление успешно завершено!',
-                        'Перенесено записей: ' + stats.totalSyncedItems + ' | Таймкодов серий: +' + stats.mergedEpisodes + '. ' + syncNote
+                var updateTimer = function () {
+                    var leftMs = transferRes.expires_at - Date.now();
+                    if (leftMs <= 0) {
+                        wrap.find('#ht-code-countdown').text('Срок действия кода истёк!').css('color', '#e74c3c');
+                        self.clearTimer();
+                        return;
+                    }
+                    var totalSec = Math.floor(leftMs / 1000);
+                    var min = Math.floor(totalSec / 60);
+                    var sec = totalSec % 60;
+                    wrap.find('#ht-code-countdown').text(
+                        'Срок действия: ' + (min < 10 ? '0' + min : min) + ':' + (sec < 10 ? '0' + sec : sec)
                     );
-                    Utils.notify('История просмотров успешно перенесена!');
-                    finish();
-                }).catch(function (err) {
-                    wrap.find('#ht-import-bar').css('background', '#e74c3c');
-                    setProgress(100, 'Ошибка при восстановлении', err.message || 'Неизвестная ошибка');
-                    Utils.notify(err.message || 'Ошибка импорта', true);
-                    finish();
+                };
+                updateTimer();
+                self.activeTimerInterval = setInterval(updateTimer, 1000);
+
+                wrap.find('[data-code-act="copy"]').on('hover:enter click', function () {
+                    Utils.copyToClipboard(transferRes.formatted_code).then(function (ok) {
+                        if (ok) Utils.notify('Код ' + transferRes.formatted_code + ' скопирован в буфер обмена');
+                        else Utils.notify('Запомните код: ' + transferRes.formatted_code);
+                    });
+                });
+
+                wrap.find('[data-code-act="cancel"]').on('hover:enter click', function () {
+                    ApiClient.cancelTransfer(transferRes.code, transferRes.delete_secret)
+                        .then(function () {
+                            Utils.notify('Перенос отменён, данные удалены из облака');
+                            self.openMainMenu();
+                        })
+                        .catch(function (err) {
+                            Utils.notify(err.message || 'Не удалось отменить перенос', true);
+                        });
+                });
+
+                wrap.find('[data-code-act="done"]').on('hover:enter click', function () {
+                    self.openMainMenu();
                 });
             }, function () { self.openMainMenu(); });
         },
 
         /**
-         * МОЙ АККАУНТ
+         * РАЗДЕЛ 3: ВОССТАНОВИТЬ ДАННЫЕ (НОВОЕ УСТРОЙСТВО)
          */
-        openAccountScreen: function (onAuthSuccess) {
+        openRestoreMenuScreen: function () {
             var self = this;
-            if (!Utils.isAuthorized()) {
-                var htmlGuest = [
-                    '<div class="ht-header">',
-                    '  <div class="ht-title">👤 Мой аккаунт History Transfer</div>',
-                    '  <span class="ht-badge ht-badge--warn">Гость</span>',
-                    '</div>',
-                    '<p style="color:rgba(255,255,255,0.75);line-height:1.45;margin-bottom:1.2em;">',
-                    '  Создайте отдельный аккаунт для переноса истории или войдите в существующий. ',
-                    '  Пароли от Lampa/CUB не запрашиваются и не передаются.',
-                    '</p>',
-                    '<div class="ht-menu-list">',
-                    '  <div class="ht-menu-item selector" data-auth="login">',
-                    '    <div class="ht-menu-left"><div class="ht-menu-icon">🔑</div><div><div class="ht-menu-text-title">Войти в существующий аккаунт</div><div class="ht-menu-text-desc">Использовать логин и пароль History Transfer</div></div></div>',
-                    '    <div class="ht-menu-arrow">❯</div>',
-                    '  </div>',
-                    '  <div class="ht-menu-item selector" data-auth="register">',
-                    '    <div class="ht-menu-left"><div class="ht-menu-icon">✨</div><div><div class="ht-menu-text-title">Зарегистрировать новый аккаунт</div><div class="ht-menu-text-desc">Создать учётную запись в облаке переноса</div></div></div>',
-                    '    <div class="ht-menu-arrow">❯</div>',
-                    '  </div>',
-                    '</div>',
-                    '<div class="ht-btn-row"><div class="ht-btn selector" data-auth="back">Назад в меню</div></div>'
-                ].join('');
+            var hasLocalSlot = Boolean(Lampa.Storage.get(STORAGE_KEYS.LOCAL_BACKUP_SLOT, null));
 
-                this.openScreen(htmlGuest, function (wrap) {
-                    wrap.find('[data-auth="login"]').on('hover:enter click', function () { self.promptCredentials('login', onAuthSuccess); });
-                    wrap.find('[data-auth="register"]').on('hover:enter click', function () { self.promptCredentials('register', onAuthSuccess); });
-                    wrap.find('[data-auth="back"]').on('hover:enter click', function () { self.openMainMenu(); });
-                }, function () { self.openMainMenu(); });
-                return;
-            }
-
-            var user = Utils.getUser();
-            var htmlUser = [
+            var html = [
                 '<div class="ht-header">',
-                '  <div class="ht-title">👤 Мой аккаунт</div>',
-                '  <span class="ht-badge ht-badge--ok">' + Utils.escapeHtml(user.username) + '</span>',
+                '  <div class="ht-title">📥 Восстановить данные</div>',
+                '  <span class="ht-badge">Новое устройство</span>',
                 '</div>',
-                '<div id="ht-account-profile-body">Загрузка профиля...</div>',
-                '<div class="ht-btn-row">',
-                '  <div class="ht-btn selector" data-acc="logout">Выйти</div>',
-                '  <div class="ht-btn ht-btn--danger selector" data-acc="delete_account">Удалить аккаунт</div>',
-                '  <div class="ht-btn selector" data-acc="back">Назад</div>',
-                '</div>'
+                '<p style="color:rgba(255,255,255,0.75);font-size:0.92em;margin-bottom:1em;">',
+                '  Выберите способ получения данных. Ваш текущий аккаунт Lampa/CUB останется активным.',
+                '</p>',
+                '<div class="ht-menu-list">',
+                '  <div class="ht-menu-item selector" data-rest="by_code">',
+                '    <div class="ht-menu-left">',
+                '      <div class="ht-menu-icon">🔢</div>',
+                '      <div>',
+                '        <div class="ht-menu-text-title">Ввести одноразовый код переноса</div>',
+                '        <div class="ht-menu-text-desc">Получить архив со старого устройства по 6-значному коду</div>',
+                '      </div>',
+                '    </div>',
+                '    <div class="ht-menu-arrow">❯</div>',
+                '  </div>',
+
+                '  <div class="ht-menu-item selector" data-rest="from_file">',
+                '    <div class="ht-menu-left">',
+                '      <div class="ht-menu-icon">📂</div>',
+                '      <div>',
+                '        <div class="ht-menu-text-title">Импортировать из JSON-файла</div>',
+                '        <div class="ht-menu-text-desc">Загрузить локально сохранённую резервную копию с носителя</div>',
+                '      </div>',
+                '    </div>',
+                '    <div class="ht-menu-arrow">❯</div>',
+                '  </div>',
+
+                (hasLocalSlot ? [
+                    '  <div class="ht-menu-item selector" data-rest="from_slot">',
+                    '    <div class="ht-menu-left">',
+                    '      <div class="ht-menu-icon">💾</div>',
+                    '      <div>',
+                    '        <div class="ht-menu-text-title">Восстановить из локального слота памяти</div>',
+                    '        <div class="ht-menu-text-desc">Использовать резервную копию, сохранённую в памяти Lampa</div>',
+                    '      </div>',
+                    '    </div>',
+                    '    <div class="ht-menu-arrow">❯</div>',
+                    '  </div>'
+                ].join('') : ''),
+                '</div>',
+                '<div class="ht-btn-row"><div class="ht-btn selector" data-rest="back">Назад в меню</div></div>'
             ].join('');
 
-            this.openScreen(htmlUser, function (wrap) {
-                ApiClient.getProfile().then(function (res) {
-                    var logsHtml = '';
-                    if (res.logs && res.logs.length > 0) {
-                        logsHtml = '<div style="margin-top:1em;font-weight:600;">Последние операции:</div><table class="ht-info-table">';
-                        res.logs.slice(0, 5).forEach(function (l) {
-                            logsHtml += '<tr><td>' + Utils.escapeHtml(l.action) + ' (' + Utils.escapeHtml(l.target_account_label || '') + ')</td>' +
-                                '<td style="text-align:right;">' + l.items_processed + ' зап. • ' + Utils.formatDate(l.created_at) + '</td></tr>';
-                        });
-                        logsHtml += '</table>';
+            this.openScreen(html, function (wrap) {
+                wrap.find('[data-rest="by_code"]').on('hover:enter click', function () {
+                    self.promptTransferCode();
+                });
+
+                wrap.find('[data-rest="from_file"]').on('hover:enter click', function () {
+                    self.triggerJsonFileUpload();
+                });
+
+                wrap.find('[data-rest="from_slot"]').on('hover:enter click', function () {
+                    var slotArchive = Lampa.Storage.get(STORAGE_KEYS.LOCAL_BACKUP_SLOT, null);
+                    if (!slotArchive) {
+                        Utils.notify('Локальная копия не найдена', true);
+                        return;
                     }
-                    wrap.find('#ht-account-profile-body').html([
-                        '<table class="ht-info-table">',
-                        '  <tr><td>Логин</td><td style="text-align:right;">' + Utils.escapeHtml(res.user.username) + '</td></tr>',
-                        '  <tr><td>Дата регистрации</td><td style="text-align:right;">' + Utils.formatDate(res.user.created_at) + '</td></tr>',
-                        '  <tr><td>Резервная копия</td><td style="text-align:right;">' + (res.backup ? res.backup.cards_count + ' карт. / ' + res.backup.history_count + ' в истории' : 'Нет копии') + '</td></tr>',
-                        '</table>',
-                        logsHtml
-                    ].join(''));
-                }).catch(function (err) {
-                    wrap.find('#ht-account-profile-body').text('Ошибка: ' + err.message);
-                });
-
-                wrap.find('[data-acc="logout"]').on('hover:enter click', function () {
-                    ApiClient.logout().catch(function () {});
-                    Lampa.Storage.set(STORAGE_KEYS.TOKEN, '');
-                    Lampa.Storage.set(STORAGE_KEYS.USER, null);
-                    Utils.notify('Вы вышли из аккаунта');
-                    self.openMainMenu();
-                });
-
-                wrap.find('[data-acc="delete_account"]').on('hover:enter click', function () {
-                    self.confirmAction('Удалить аккаунт навсегда?', 'Все ваши резервные копии и история операций на сервере будут удалены.', function () {
-                        ApiClient.deleteAccount().then(function () {
-                            Lampa.Storage.set(STORAGE_KEYS.TOKEN, '');
-                            Lampa.Storage.set(STORAGE_KEYS.USER, null);
-                            Utils.notify('Аккаунт удалён');
-                            self.openMainMenu();
-                        }).catch(function (err) { Utils.notify(err.message, true); });
+                    var err = DataEngine.validateArchive(slotArchive, true);
+                    if (err) {
+                        Utils.notify(err, true);
+                        return;
+                    }
+                    self.openRestoreModeSelection({
+                        sourceType: 'slot',
+                        sourceLabel: 'Локальный слот памяти Lampa',
+                        createdAt: slotArchive.created_at,
+                        summary: DataEngine.collectStats(slotArchive.data),
+                        archive: slotArchive
                     });
                 });
 
-                wrap.find('[data-acc="back"]').on('hover:enter click', function () { self.openMainMenu(); });
+                wrap.find('[data-rest="back"]').on('hover:enter click', function () {
+                    self.openMainMenu();
+                });
             }, function () { self.openMainMenu(); });
         },
 
-        promptCredentials: function (mode, onAuthSuccess) {
+        promptTransferCode: function () {
             var self = this;
-            var isReg = mode === 'register';
             Lampa.Modal.close();
 
             Lampa.Input.edit({
-                title: isReg ? 'Придумайте логин (латиница, 3-32 симв.)' : 'Введите логин History Transfer',
+                title: 'Введите 6-значный код переноса (например: 583921)',
                 value: '',
                 free: true,
                 nosave: true
-            }, function (username) {
-                username = String(username || '').trim();
-                if (!username) { self.openAccountScreen(onAuthSuccess); return; }
+            }, function (inputVal) {
+                var cleanCode = Utils.normalizeCode(inputVal);
+                if (!cleanCode) {
+                    self.openRestoreMenuScreen();
+                    return;
+                }
+                if (cleanCode.length !== 6) {
+                    Utils.notify('Код переноса должен состоять из 6 цифр', true);
+                    self.openRestoreMenuScreen();
+                    return;
+                }
 
-                setTimeout(function () {
-                    Lampa.Input.edit({
-                        title: isReg ? 'Придумайте пароль (минимум 6 символов)' : 'Введите пароль',
-                        value: '',
-                        free: true,
-                        nosave: true
-                    }, function (password) {
-                        password = String(password || '');
-                        if (!password) { self.openAccountScreen(onAuthSuccess); return; }
-
-                        Utils.notify(isReg ? 'Регистрация...' : 'Вход...');
-                        var req = isReg ? ApiClient.register(username, password) : ApiClient.login(username, password);
-                        req.then(function (res) {
-                            Lampa.Storage.set(STORAGE_KEYS.TOKEN, res.token);
-                            Lampa.Storage.set(STORAGE_KEYS.USER, res.user);
-                            Utils.notify('Успешный вход: ' + res.user.username);
-                            if (typeof onAuthSuccess === 'function') onAuthSuccess();
-                            else self.openMainMenu();
-                        }).catch(function (err) {
-                            Utils.notify(err.message || 'Ошибка авторизации', true);
-                            self.openAccountScreen(onAuthSuccess);
+                Utils.notify('Проверка кода ' + Utils.formatCode(cleanCode) + '...');
+                ApiClient.inspectTransfer(cleanCode)
+                    .then(function (info) {
+                        if (Number(info.schema_version) > ARCHIVE_VERSION) {
+                            throw new Error('Неподдерживаемая версия архива. Обновите плагин.');
+                        }
+                        self.openRestoreModeSelection({
+                            sourceType: 'cloud',
+                            code: cleanCode,
+                            formattedCode: info.formatted_code,
+                            sourceLabel: info.source_device || 'Устройство Lampa',
+                            createdAt: info.created_at,
+                            expiresAt: info.expires_at,
+                            summary: info.summary
                         });
+                    })
+                    .catch(function (err) {
+                        Utils.notify(err.message || 'Ошибка проверки кода', true);
+                        self.openRestoreMenuScreen();
                     });
-                }, 200);
             });
         },
 
         /**
-         * ОБЛАЧНОЕ ХРАНИЛИЩЕ
+         * Показ содержимого переноса и выбор режима восстановления
          */
-        openCloudStorageScreen: function () {
+        openRestoreModeSelection: function (context) {
             var self = this;
-            if (!Utils.isAuthorized()) {
-                Utils.notify('Войдите в аккаунт для просмотра хранилища', true);
-                this.openAccountScreen(function () { self.openCloudStorageScreen(); });
-                return;
-            }
+            var s = context.summary || {};
+            var localStats = DataEngine.collectStats();
+
+            var bCards = s.cards || 0;
+            var bHistory = s.byList ? s.byList.history : (s.history || 0);
+            var bBook = s.byList ? s.byList.book : (s.book || 0);
+            var bViewed = s.byList ? s.byList.viewed : (s.viewed || 0);
+            var bLike = s.byList ? s.byList.like : (s.like || 0);
+            var bTimeline = s.timelineCount !== undefined ? s.timelineCount : (s.timeline || 0);
 
             var html = [
                 '<div class="ht-header">',
-                '  <div class="ht-title">☁️ Облачное хранилище</div>',
-                '  <span class="ht-badge">Cloudflare D1</span>',
+                '  <div class="ht-title">📦 Содержимое переноса</div>',
+                '  <span class="ht-badge ht-badge--ok">' + (context.formattedCode || 'JSON-архив') + '</span>',
                 '</div>',
-                '<div id="ht-cloud-body">Загрузка информации...</div>',
-                '<div class="ht-btn-row" id="ht-cloud-btns">',
-                '  <div class="ht-btn selector" data-cloud="back">Назад в меню</div>',
+                '<p style="font-size:0.88em;color:rgba(255,255,255,0.75);margin-bottom:0.7em;">',
+                '  Источник: <strong>' + Utils.escapeHtml(context.sourceLabel) + '</strong> • Создан: ' + Utils.formatDate(context.createdAt),
+                '</p>',
+                '<table class="ht-info-table">',
+                '  <thead><tr><th>Категория данных</th><th>В переносе</th><th>Сейчас на устройстве</th></tr></thead>',
+                '  <tbody>',
+                '    <tr><td>Полные карточки (card)</td><td><strong>' + bCards + '</strong></td><td>' + localStats.cards + '</td></tr>',
+                '    <tr><td>История просмотров (history)</td><td><strong>' + bHistory + '</strong></td><td>' + localStats.byList.history + '</td></tr>',
+                '    <tr><td>Закладки (book)</td><td><strong>' + bBook + '</strong></td><td>' + localStats.byList.book + '</td></tr>',
+                '    <tr><td>Просмотрено (viewed)</td><td><strong>' + bViewed + '</strong></td><td>' + localStats.byList.viewed + '</td></tr>',
+                '    <tr><td>Избранное (like)</td><td><strong>' + bLike + '</strong></td><td>' + localStats.byList.like + '</td></tr>',
+                '    <tr><td>Прогресс серий и таймкоды</td><td><strong>' + bTimeline + '</strong></td><td>' + localStats.timelineCount + '</td></tr>',
+                '  </tbody>',
+                '</table>',
+                '<div class="ht-menu-list" style="margin-top:0.9em;">',
+                '  <div class="ht-menu-item selector" data-rmode="merge">',
+                '    <div class="ht-menu-left">',
+                '      <div class="ht-menu-icon">🔀</div>',
+                '      <div>',
+                '        <div class="ht-menu-text-title">Режим 2: Объединение (Рекомендуется)</div>',
+                '        <div class="ht-menu-text-desc">Безопасно объединить истории без дубликатов и потери текущих закладок</div>',
+                '      </div>',
+                '    </div>',
+                '    <div class="ht-menu-arrow">❯</div>',
+                '  </div>',
+                '  <div class="ht-menu-item selector" data-rmode="replace">',
+                '    <div class="ht-menu-left">',
+                '      <div class="ht-menu-icon">♻️</div>',
+                '      <div>',
+                '        <div class="ht-menu-text-title">Режим 1: Полная замена</div>',
+                '        <div class="ht-menu-text-desc">Заменить существующие данные нового устройства данными из переноса</div>',
+                '      </div>',
+                '    </div>',
+                '    <div class="ht-menu-arrow">❯</div>',
+                '  </div>',
+                '</div>',
+                '<div class="ht-btn-row"><div class="ht-btn selector" data-rmode="cancel">Отмена</div></div>'
+            ].join('');
+
+            this.openScreen(html, function (wrap) {
+                wrap.find('[data-rmode="merge"]').on('hover:enter click', function () {
+                    self.executeRestoreProcess(context, 'merge');
+                });
+
+                wrap.find('[data-rmode="replace"]').on('hover:enter click', function () {
+                    self.confirmFullReplaceWarning(function () {
+                        self.executeRestoreProcess(context, 'replace');
+                    }, function () {
+                        self.openRestoreModeSelection(context);
+                    });
+                });
+
+                wrap.find('[data-rmode="cancel"]').on('hover:enter click', function () {
+                    self.openMainMenu();
+                });
+            }, function () { self.openMainMenu(); });
+        },
+
+        confirmFullReplaceWarning: function (onConfirm, onCancel) {
+            var html = [
+                '<div class="ht-header">',
+                '  <div class="ht-title">⚠️ Внимание: Полная замена данных</div>',
+                '</div>',
+                '<div class="ht-warn-box">',
+                '  Вы выбрали режим <strong>Полной замены</strong>. Вся текущая история просмотров, закладки и списки на этом устройстве ',
+                '  будут полностью заменены данными из переноса. При сбое сработает автоматический откат, но после успешного завершения отменить замену будет нельзя.',
+                '</div>',
+                '<div class="ht-btn-row">',
+                '  <div class="ht-btn ht-btn--danger selector" data-warn="yes">Да, заменить данные</div>',
+                '  <div class="ht-btn selector" data-warn="no">Назад к выбору режима</div>',
                 '</div>'
             ].join('');
 
             this.openScreen(html, function (wrap) {
-                ApiClient.getBackupStatus().then(function (res) {
-                    if (!res.exists || !res.backup) {
-                        wrap.find('#ht-cloud-body').html('<p style="color:rgba(255,255,255,0.7);padding:1em 0;">Резервная копия отсутствует.</p>');
-                        return;
-                    }
-                    var b = res.backup;
-                    wrap.find('#ht-cloud-body').html([
-                        '<table class="ht-info-table">',
-                        '  <tr><td>Исходный аккаунт</td><td style="text-align:right;">' + Utils.escapeHtml(b.source_account_label) + '</td></tr>',
-                        '  <tr><td>Записей в истории (history)</td><td style="text-align:right;">' + b.history_count + '</td></tr>',
-                        '  <tr><td>Полных карточек (card)</td><td style="text-align:right;">' + b.cards_count + '</td></tr>',
-                        '  <tr><td>Таймкодов серий</td><td style="text-align:right;">' + b.episodes_count + '</td></tr>',
-                        '  <tr><td>Размер копии</td><td style="text-align:right;">' + Utils.formatBytes(b.size_bytes) + '</td></tr>',
-                        '  <tr><td>Обновлено</td><td style="text-align:right;">' + Utils.formatDate(b.updated_at) + '</td></tr>',
-                        '  <tr><td>SHA-256</td><td style="text-align:right;">' + Utils.escapeHtml((b.checksum || '').slice(0, 16)) + '...</td></tr>',
-                        '</table>'
-                    ].join(''));
+                wrap.find('[data-warn="yes"]').on('hover:enter click', onConfirm);
+                wrap.find('[data-warn="no"]').on('hover:enter click', onCancel);
+            }, onCancel);
+        },
 
-                    wrap.find('#ht-cloud-btns').prepend('<div class="ht-btn ht-btn--danger selector" data-cloud="delete">Удалить копию</div>');
+        executeRestoreProcess: function (context, mode) {
+            var self = this;
+            var modeName = mode === 'replace' ? 'Полная замена' : 'Объединение';
+
+            var html = [
+                '<div class="ht-header">',
+                '  <div class="ht-title">📥 Восстановление данных</div>',
+                '  <span class="ht-badge">' + modeName + '</span>',
+                '</div>',
+                '<div class="ht-progress-wrap">',
+                '  <div id="ht-imp-step">Получение архива...</div>',
+                '  <div class="ht-progress-bar-bg"><div class="ht-progress-bar-fill" id="ht-imp-bar"></div></div>',
+                '  <div id="ht-imp-sub" style="font-size:0.85em;color:rgba(255,255,255,0.65);">Не выключайте устройство до завершения...</div>',
+                '</div>',
+                '<div class="ht-btn-row" id="ht-imp-footer" style="display:none;">',
+                '  <div class="ht-btn ht-btn--primary selector" data-done="1">Готово</div>',
+                '</div>'
+            ].join('');
+
+            this.openScreen(html, function (wrap) {
+                var setStep = function (pct, step, sub) {
+                    wrap.find('#ht-imp-bar').css('width', pct + '%');
+                    wrap.find('#ht-imp-step').text(step);
+                    if (sub !== undefined) wrap.find('#ht-imp-sub').text(sub);
+                };
+
+                var showFooter = function () {
+                    wrap.find('#ht-imp-footer').show();
                     Lampa.Controller.collectionSet(wrap);
-
-                    wrap.find('[data-cloud="delete"]').on('hover:enter click', function () {
-                        self.confirmAction('Удалить резервную копию из облака?', 'Локальные данные на устройстве останутся без изменений.', function () {
-                            ApiClient.deleteBackup().then(function () {
-                                Utils.notify('Резервная копия удалена');
-                                self.openCloudStorageScreen();
-                            }).catch(function (err) { Utils.notify(err.message, true); });
-                        });
+                    var btn = wrap.find('.selector').first()[0];
+                    if (btn) Lampa.Controller.collectionFocus(btn, wrap);
+                    wrap.find('[data-done="1"]').on('hover:enter click', function () {
+                        self.openMainMenu();
                     });
-                }).catch(function (err) {
-                    wrap.find('#ht-cloud-body').text('Ошибка: ' + err.message);
-                });
+                };
 
-                wrap.find('[data-cloud="back"]').on('hover:enter click', function () { self.openMainMenu(); });
+                var archivePromise;
+                if (context.sourceType === 'cloud') {
+                    setStep(15, 'Скачивание архива по одноразовому коду...');
+                    archivePromise = ApiClient.claimTransfer(context.code).then(function (res) {
+                        return res.archive;
+                    });
+                } else {
+                    archivePromise = Promise.resolve(context.archive);
+                }
+
+                archivePromise
+                    .then(function (archive) {
+                        return DataEngine.restoreArchive(archive, mode, function (pct, msg) {
+                            setStep(pct, msg);
+                        });
+                    })
+                    .then(function (result) {
+                        var totalRestored = result.totalRestoredItems + result.mergedTimeline;
+                        Utils.logOperation('Восстановление данных', modeName, totalRestored, 'Успешно');
+
+                        var syncInfo = result.cubSynced
+                            ? 'Синхронизация с текущим аккаунтом CUB запущена.'
+                            : 'Данные сохранены в локальном профиле Lampa.';
+
+                        setStep(
+                            100,
+                            'Перенос успешно завершён!',
+                            'Карточек: +' + result.addedCards + ' | Записей в списках: +' + result.totalRestoredItems +
+                            ' | Таймкодов: +' + result.mergedTimeline + '. ' + syncInfo
+                        );
+                        Utils.notify('Данные успешно восстановлены!');
+                        showFooter();
+                    })
+                    .catch(function (err) {
+                        Utils.logOperation('Восстановление данных', modeName, 0, 'Ошибка: ' + err.message);
+                        wrap.find('#ht-imp-bar').css('background', '#e74c3c');
+                        setStep(100, 'Ошибка при восстановлении', err.message || 'Не удалось восстановить данные');
+                        Utils.notify(err.message || 'Ошибка восстановления', true);
+                        showFooter();
+                    });
             }, function () { self.openMainMenu(); });
         },
 
         /**
-         * НАСТРОЙКИ
+         * Локальный импорт из JSON-файла
+         */
+        triggerJsonFileUpload: function () {
+            var self = this;
+            var input = document.createElement('input');
+            input.type = 'file';
+            input.accept = '.json,application/json';
+            input.style.display = 'none';
+
+            input.onchange = function (e) {
+                var file = e.target.files && e.target.files[0];
+                if (!file) return;
+
+                var reader = new FileReader();
+                reader.onload = function (ev) {
+                    try {
+                        var parsed = JSON.parse(ev.target.result);
+                        var err = DataEngine.validateArchive(parsed, true);
+                        if (err) {
+                            Utils.notify(err, true);
+                            return;
+                        }
+                        self.openRestoreModeSelection({
+                            sourceType: 'file',
+                            sourceLabel: 'Файл: ' + file.name,
+                            createdAt: parsed.created_at,
+                            summary: DataEngine.collectStats(parsed.data),
+                            archive: parsed
+                        });
+                    } catch (parseErr) {
+                        Utils.notify('Ошибка проверки данных: невалидный JSON-файл.', true);
+                    }
+                };
+                reader.readAsText(file);
+            };
+
+            document.body.appendChild(input);
+            input.click();
+            setTimeout(function () {
+                if (input.parentNode) input.parentNode.removeChild(input);
+            }, 5000);
+        },
+
+        /**
+         * РАЗДЕЛ 4: ИНФОРМАЦИЯ О ПЕРЕНОСЕ И ЛОКАЛЬНЫЙ ЭКСПОРТ В JSON
+         */
+        openTransferInfoScreen: function () {
+            var self = this;
+            var stats = DataEngine.collectStats();
+
+            var rows = FAVORITE_LIST_KEYS.map(function (k) {
+                return '<tr><td>' + LIST_TITLES[k] + ' (<code>' + k + '</code>)</td><td style="text-align:right;"><strong>' + stats.byList[k] + '</strong></td></tr>';
+            }).join('');
+
+            var html = [
+                '<div class="ht-header">',
+                '  <div class="ht-title">📊 Информация о переносе</div>',
+                '  <span class="ht-badge">Резервные копии</span>',
+                '</div>',
+                '<table class="ht-info-table">',
+                '  <tr><td>Полные карточки фильмов/сериалов (<code>card</code>)</td><td style="text-align:right;"><strong>' + stats.cards + '</strong></td></tr>',
+                rows,
+                '  <tr><td>Прогресс просмотра (<code>file_view</code>)</td><td style="text-align:right;"><strong>' + stats.timelineCount + '</strong></td></tr>',
+                '  <tr><td>Просмотренные серии (<code>online/torrents</code>)</td><td style="text-align:right;"><strong>' + stats.episodesCount + '</strong></td></tr>',
+                '</table>',
+                '<div class="ht-btn-row">',
+                '  <div class="ht-btn ht-btn--primary selector" data-info="export_json">Скачать JSON-файл резервной копии</div>',
+                '  <div class="ht-btn selector" data-info="save_slot">Сохранить в локальный слот Lampa</div>',
+                '  <div class="ht-btn selector" data-info="back">Назад</div>',
+                '</div>'
+            ].join('');
+
+            this.openScreen(html, function (wrap) {
+                wrap.find('[data-info="export_json"]').on('hover:enter click', function () {
+                    try {
+                        var archive = DataEngine.buildExportArchive();
+                        var err = DataEngine.validateArchive(archive, false);
+                        if (err) {
+                            Utils.notify(err, true);
+                            return;
+                        }
+                        var jsonStr = JSON.stringify(archive, null, 2);
+                        var blob = new Blob([jsonStr], { type: 'application/json;charset=utf-8' });
+                        var url = URL.createObjectURL(blob);
+                        var a = document.createElement('a');
+                        var dateTag = new Date().toISOString().slice(0, 10);
+                        a.href = url;
+                        a.download = 'lampa-history-backup-' + dateTag + '.json';
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+
+                        Utils.logOperation('Локальный экспорт JSON', 'Файл .json', archive.data.favorite.card.length, 'Успешно');
+                        Utils.notify('Резервная копия JSON сформирована и отправлена на скачивание');
+                    } catch (e) {
+                        Utils.notify('Устройство не поддерживает прямое скачивание файлов. Используйте «Сохранить в локальный слот».', true);
+                    }
+                });
+
+                wrap.find('[data-info="save_slot"]').on('hover:enter click', function () {
+                    try {
+                        var archive = DataEngine.buildExportArchive();
+                        var err = DataEngine.validateArchive(archive, false);
+                        if (err) {
+                            Utils.notify(err, true);
+                            return;
+                        }
+                        Lampa.Storage.set(STORAGE_KEYS.LOCAL_BACKUP_SLOT, archive);
+                        Utils.logOperation('Локальный бэкап', 'Слот памяти Lampa', archive.data.favorite.card.length, 'Успешно');
+                        Utils.notify('Резервная копия сохранена в локальный слот Lampa');
+                    } catch (e) {
+                        Utils.notify('Недостаточно места в локальном хранилище устройства', true);
+                    }
+                });
+
+                wrap.find('[data-info="back"]').on('hover:enter click', function () {
+                    self.openMainMenu();
+                });
+            }, function () { self.openMainMenu(); });
+        },
+
+        /**
+         * РАЗДЕЛ 5: ИСТОРИЯ ОПЕРАЦИЙ
+         */
+        openOperationsHistoryScreen: function () {
+            var self = this;
+            var logs = Lampa.Storage.get(STORAGE_KEYS.OPERATIONS_LOG, []);
+            if (!Array.isArray(logs)) logs = [];
+
+            var bodyHtml;
+            if (logs.length === 0) {
+                bodyHtml = '<p style="color:rgba(255,255,255,0.65);padding:1.2em 0;">На этом устройстве ещё не выполнялись операции переноса.</p>';
+            } else {
+                var rows = logs.map(function (item) {
+                    return '<tr>' +
+                        '<td>' + Utils.formatDate(item.timestamp) + '</td>' +
+                        '<td><strong>' + Utils.escapeHtml(item.type) + '</strong> (' + Utils.escapeHtml(item.mode) + ')</td>' +
+                        '<td>' + item.items + ' зап.</td>' +
+                        '<td style="text-align:right;">' + Utils.escapeHtml(item.status) + '</td>' +
+                        '</tr>';
+                }).join('');
+
+                bodyHtml = [
+                    '<table class="ht-info-table">',
+                    '  <thead><tr><th>Дата</th><th>Операция</th><th>Объём</th><th style="text-align:right;">Статус</th></tr></thead>',
+                    '  <tbody>' + rows + '</tbody>',
+                    '</table>'
+                ].join('');
+            }
+
+            var html = [
+                '<div class="ht-header">',
+                '  <div class="ht-title">🕒 История операций</div>',
+                '  <span class="ht-badge">Журнал устройства</span>',
+                '</div>',
+                bodyHtml,
+                '<div class="ht-btn-row">',
+                (logs.length > 0 ? '<div class="ht-btn ht-btn--danger selector" data-log="clear">Очистить журнал</div>' : ''),
+                '  <div class="ht-btn selector" data-log="back">Назад в меню</div>',
+                '</div>'
+            ].join('');
+
+            this.openScreen(html, function (wrap) {
+                wrap.find('[data-log="clear"]').on('hover:enter click', function () {
+                    Lampa.Storage.set(STORAGE_KEYS.OPERATIONS_LOG, []);
+                    Utils.notify('Журнал операций очищен');
+                    self.openOperationsHistoryScreen();
+                });
+
+                wrap.find('[data-log="back"]').on('hover:enter click', function () {
+                    self.openMainMenu();
+                });
+            }, function () { self.openMainMenu(); });
+        },
+
+        /**
+         * РАЗДЕЛ 6: НАСТРОЙКИ
          */
         openSettingsScreen: function () {
             var self = this;
@@ -1272,19 +1536,19 @@
                 '</div>',
                 '<div class="ht-menu-list">',
                 '  <div class="ht-menu-item selector" data-set="api_url">',
-                '    <div class="ht-menu-left"><div class="ht-menu-icon">🌐</div><div><div class="ht-menu-text-title">Адрес сервера API</div><div class="ht-menu-text-desc">' + Utils.escapeHtml(apiUrl) + '</div></div></div>',
+                '    <div class="ht-menu-left"><div class="ht-menu-icon">🌐</div><div><div class="ht-menu-text-title">Адрес облачного сервера (Cloudflare Workers)</div><div class="ht-menu-text-desc">' + Utils.escapeHtml(apiUrl) + '</div></div></div>',
                 '    <div class="ht-menu-arrow">✎</div>',
                 '  </div>',
-                '  <div class="ht-menu-item selector" data-set="test_api">',
-                '    <div class="ht-menu-left"><div class="ht-menu-icon">📡</div><div><div class="ht-menu-text-title">Проверить соединение с сервером</div><div class="ht-menu-text-desc">Проверка Cloudflare Worker и D1</div></div></div>',
+                '  <div class="ht-menu-item selector" data-set="ping">',
+                '    <div class="ht-menu-left"><div class="ht-menu-icon">📡</div><div><div class="ht-menu-text-title">Проверить доступность сервера</div><div class="ht-menu-text-desc">Диагностика соединения с Cloudflare Workers и базой D1</div></div></div>',
                 '    <div class="ht-menu-arrow">❯</div>',
                 '  </div>',
-                '  <div class="ht-menu-item selector" data-set="toggle_timeline">',
-                '    <div class="ht-menu-left"><div class="ht-menu-icon">⏱️</div><div><div class="ht-menu-text-title">Переносить таймкоды и просмотренные серии</div><div class="ht-menu-text-desc">Дополнительно к 9 разделам favorite</div></div></div>',
+                '  <div class="ht-menu-item selector" data-set="timeline">',
+                '    <div class="ht-menu-left"><div class="ht-menu-icon">⏱️</div><div><div class="ht-menu-text-title">Переносить прогресс просмотра и серии</div><div class="ht-menu-text-desc">Включать таймкоды фильмов и просмотренные эпизоды сериалов</div></div></div>',
                 '    <div class="ht-badge">' + (incTimeline ? 'ВКЛ' : 'ВЫКЛ') + '</div>',
                 '  </div>',
-                '  <div class="ht-menu-item selector" data-set="toggle_sync">',
-                '    <div class="ht-menu-left"><div class="ht-menu-icon">🔄</div><div><div class="ht-menu-text-title">Автосинхронизация с CUB после импорта</div><div class="ht-menu-text-desc">Отправлять восстановленные списки в облако нового аккаунта CUB</div></div></div>',
+                '  <div class="ht-menu-item selector" data-set="sync">',
+                '    <div class="ht-menu-left"><div class="ht-menu-icon">🔄</div><div><div class="ht-menu-text-title">Синхронизация с аккаунтом нового устройства</div><div class="ht-menu-text-desc">Автоматически отправлять восстановленные данные в текущий аккаунт CUB</div></div></div>',
                 '    <div class="ht-badge">' + (autoSync ? 'ВКЛ' : 'ВЫКЛ') + '</div>',
                 '  </div>',
                 '</div>',
@@ -1295,7 +1559,7 @@
                 wrap.find('[data-set="api_url"]').on('hover:enter click', function () {
                     Lampa.Modal.close();
                     Lampa.Input.edit({
-                        title: 'URL вашего Cloudflare Worker',
+                        title: 'Введите URL вашего Cloudflare Worker',
                         value: Utils.getApiUrl(),
                         free: true,
                         nosave: true
@@ -1309,54 +1573,43 @@
                     });
                 });
 
-                wrap.find('[data-set="test_api"]').on('hover:enter click', function () {
-                    Utils.notify('Проверка соединения...');
+                wrap.find('[data-set="ping"]').on('hover:enter click', function () {
+                    Utils.notify('Проверка соединения с сервером...');
                     ApiClient.health()
-                        .then(function (res) { Utils.notify('Сервер доступен! База D1: ' + (res.database || 'OK')); })
-                        .catch(function (err) { Utils.notify('Ошибка: ' + err.message, true); });
+                        .then(function (res) {
+                            Utils.notify('Сервер онлайн! База данных D1: ' + (res.database || 'OK'));
+                        })
+                        .catch(function (err) {
+                            Utils.notify(err.message || 'Сервер временно недоступен', true);
+                        });
                 });
 
-                wrap.find('[data-set="toggle_timeline"]').on('hover:enter click', function () {
+                wrap.find('[data-set="timeline"]').on('hover:enter click', function () {
                     Lampa.Storage.set(STORAGE_KEYS.INCLUDE_TIMELINE, !incTimeline);
                     self.openSettingsScreen();
                 });
 
-                wrap.find('[data-set="toggle_sync"]').on('hover:enter click', function () {
+                wrap.find('[data-set="sync"]').on('hover:enter click', function () {
                     Lampa.Storage.set(STORAGE_KEYS.AUTO_SYNC_CUB, !autoSync);
                     self.openSettingsScreen();
                 });
 
-                wrap.find('[data-set="back"]').on('hover:enter click', function () { self.openMainMenu(); });
-            }, function () { self.openMainMenu(); });
-        },
-
-        confirmAction: function (title, message, onConfirm) {
-            var self = this;
-            var html = [
-                '<div class="ht-header"><div class="ht-title">' + Utils.escapeHtml(title) + '</div></div>',
-                '<p style="color:rgba(255,255,255,0.8);line-height:1.5;margin-bottom:1.2em;">' + Utils.escapeHtml(message) + '</p>',
-                '<div class="ht-btn-row">',
-                '  <div class="ht-btn ht-btn--danger selector" data-cfm="yes">Подтвердить</div>',
-                '  <div class="ht-btn selector" data-cfm="no">Отмена</div>',
-                '</div>'
-            ].join('');
-
-            this.openScreen(html, function (wrap) {
-                wrap.find('[data-cfm="yes"]').on('hover:enter click', onConfirm);
-                wrap.find('[data-cfm="no"]').on('hover:enter click', function () { self.openMainMenu(); });
+                wrap.find('[data-set="back"]').on('hover:enter click', function () {
+                    self.openMainMenu();
+                });
             }, function () { self.openMainMenu(); });
         }
     };
 
     /**
      * ========================================================================
-     * ИНИЦИАЛИЗАЦИЯ ПЛАГИНА
+     * РЕГИСТРАЦИЯ ПЛАГИНА В ИНТЕРФЕЙСЕ LAMPA
      * ========================================================================
      */
     function startPlugin() {
         injectStyles();
 
-        var menuButton = $([
+        var menuItem = $([
             '<li class="menu__item selector" data-action="' + PLUGIN_ID + '">',
             '  <div class="menu__ico">',
             '    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">',
@@ -1366,29 +1619,29 @@
             '      <path d="M21 13v2a4 4 0 0 1-4 4H3"></path>',
             '    </svg>',
             '  </div>',
-            '  <div class="menu__text">History Transfer</div>',
+            '  <div class="menu__text">' + PLUGIN_NAME + '</div>',
             '</li>'
         ].join(''));
 
-        menuButton.on('hover:enter click', function () {
+        menuItem.on('hover:enter click', function () {
             UI.openMainMenu();
         });
 
-        $('.menu .menu__list').eq(0).append(menuButton);
+        $('.menu .menu__list').eq(0).append(menuItem);
 
         if (Lampa.SettingsApi) {
             Lampa.SettingsApi.addComponent({
                 component: PLUGIN_ID,
-                name: 'History Transfer',
+                name: PLUGIN_NAME,
                 icon: '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"></polyline><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><polyline points="7 23 3 19 7 15"></polyline><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>'
             });
 
             Lampa.SettingsApi.addParam({
                 component: PLUGIN_ID,
-                param: { name: 'ht_open_manager', type: 'button' },
+                param: { name: 'ht_v2_open', type: 'button' },
                 field: {
-                    name: 'Открыть менеджер переноса истории',
-                    description: 'Экспорт и импорт всех разделов профиля Lampa/CUB'
+                    name: 'Открыть History Transfer',
+                    description: 'Перенос истории, закладок и серий между устройствами по одноразовому коду'
                 },
                 onChange: function () { UI.openMainMenu(); }
             });
